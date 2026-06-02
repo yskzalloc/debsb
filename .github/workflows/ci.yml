@@ -1,0 +1,29 @@
+name: CI
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 cloud-image-utils whois wget openssh-client
+
+      - name: Install debsb
+        run: pip install -e .
+
+      - name: Build sandbox
+        run: debsb build --size 10G --reset --verbose
+
+      - name: Run test
+        run: debsb run --root --exec "ls -ahl .debsb; uname -a"

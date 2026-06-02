@@ -263,9 +263,8 @@ def cmd_run(args):
 
     if args.gui or args.graphics:
         cmd += ["-display", "gtk", "-vga", "virtio"]
-        cmd += ["-display", "gtk", "-vga", "virtio"]
         os.execvp(cmd[0], cmd)
-    elif args.ssh:
+    elif getattr(args, 'exec') or args.ssh:
         cmd += ["-display", "none", "-vga", "none",
                 "-serial", "null", "-monitor", "none", "-daemonize"]
         subprocess.check_call(cmd)
@@ -284,6 +283,11 @@ def cmd_run(args):
                 time.sleep(2)
         else:
             die("SSH timeout")
+        if getattr(args, 'exec'):
+            ret = subprocess.call(["ssh"] + ssh_opts + [f"{user}@localhost", getattr(args, 'exec')])
+            subprocess.call(["ssh"] + ssh_opts + [f"{user}@localhost", "poweroff"],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            sys.exit(ret)
         print(f"Connecting as {user}...")
         print(f"  Reconnect: ssh -i {SSH_KEY} -p {SSH_PORT} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null {user}@localhost")
         os.execvp("ssh", ["ssh"] + ssh_opts + [f"{user}@localhost"])
@@ -305,6 +309,7 @@ def main():
     p_run = sub.add_parser("run", help="Boot the sandbox VM")
     p_run.add_argument("--ssh", action="store_true", help="Boot headless, open SSH session")
     p_run.add_argument("--root", action="store_true", help="Login as root (default: debian user)")
+    p_run.add_argument("--exec", metavar="CMD", help="Boot, run command via SSH, then shutdown")
     p_run.add_argument("--gui", action="store_true", help="Graphical QEMU window")
     p_run.add_argument("--verbose", action="store_true", help="Extra QEMU debug output")
     p_run.add_argument("--append", "-a", action="append", default=[], help="Additional kernel boot options")
