@@ -309,7 +309,7 @@ def main():
     p_run = sub.add_parser("run", help="Boot the sandbox VM")
     p_run.add_argument("--ssh", action="store_true", help="Boot headless, open SSH session")
     p_run.add_argument("--root", action="store_true", help="Login as root (default: debian user)")
-    p_run.add_argument("--exec", metavar="CMD", help="Boot, run command via SSH, then shutdown")
+    p_run.add_argument("--exec", metavar="CMD", help="Boot, run command via SSH, then shutdown (implies --ssh)")
     p_run.add_argument("--gui", action="store_true", help="Graphical QEMU window")
     p_run.add_argument("--verbose", action="store_true", help="Extra QEMU debug output")
     p_run.add_argument("--append", "-a", action="append", default=[], help="Additional kernel boot options")
