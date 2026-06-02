@@ -1,0 +1,10 @@
+LICENSE
+README.md
+pyproject.toml
+src/debsb/__init__.py
+src/debsb/cli.py
+src/debsb.egg-info/PKG-INFO
+src/debsb.egg-info/SOURCES.txt
+src/debsb.egg-info/dependency_links.txt
+src/debsb.egg-info/entry_points.txt
+src/debsb.egg-info/top_level.txt

@@ -1,0 +1,2 @@
+[console_scripts]
+debsb = debsb.cli:entry_point
