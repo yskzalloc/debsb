@@ -26,4 +26,4 @@ jobs:
         run: debsb build --size 10G --reset --verbose
 
       - name: Run test
-        run: debsb run --root --exec "ls -ahl .debsb; uname -a"
+        run: debsb run --ssh --root --exec "ls -ahl .debsb; uname -a"

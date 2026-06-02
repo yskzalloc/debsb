@@ -48,6 +48,9 @@ debsb run --ssh
 # SSH as root
 debsb run --ssh --root
 
+# Run a command and auto-shutdown (requires --ssh)
+debsb run --ssh --root --exec "apt update && apt upgrade -y"
+
 # Graphical QEMU window
 debsb run --graphics
 
@@ -57,6 +60,18 @@ debsb run --sound
 # Extra QEMU options
 debsb run --qemu-opts='-m 8192'
 ```
+
+### Execute a command
+
+`--exec` runs a command via SSH and shuts down automatically. Requires `--ssh`:
+
+```bash
+debsb run --ssh --exec "uname -a"
+debsb run --ssh --root --exec "ls -ahl .debsb"
+debsb run --ssh --exec "./my-script.sh"
+```
+
+This is useful for CI/automation. The exit code of the command is propagated.
 
 ### Verbose mode
 
