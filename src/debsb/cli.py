@@ -108,6 +108,8 @@ def cmd_build(args):
 
     # Resize
     size = args.size or "20G"
+    if size[-1].isdigit():
+        die("--size requires a unit suffix (e.g. 20G, 50G)")
     print(f"Resizing image to {size}...")
     subprocess.check_call(["qemu-img", "resize", qcow2, size])
 
