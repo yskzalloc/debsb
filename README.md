@@ -23,6 +23,11 @@ On Debian/Ubuntu:
 sudo apt install qemu-system-x86 cloud-image-utils whois wget openssh-client
 ```
 
+For `--debian` kernel builds, additionally:
+```bash
+sudo apt install python3-dacite python3-debian python3-jinja2 debhelper quilt rsync devscripts dh-python
+```
+
 ## Usage
 
 ### Build the sandbox (one-time)
@@ -37,6 +42,31 @@ Use `--reset` to skip the prompt and rebuild from scratch:
 ```bash
 debsb build --size 20G --reset
 ```
+
+### Build with a custom kernel (upstream)
+
+```bash
+debsb build ~/linux --configitem CONFIG_KASAN=y --configitem CONFIG_KCOV=y
+```
+
+This:
+1. Sets up the cloud image (if not already done)
+2. Generates a default kernel config (`make defconfig`) with VM-essential options
+3. Applies `--configitem` entries
+4. Runs `make olddefconfig` and `make bindeb-pkg`
+5. Installs the resulting `.deb` into the VM via GRUB
+
+### Build with Debian kernel (salsa)
+
+```bash
+# Default branch (debian/latest)
+debsb build --debian --configitem CONFIG_KASAN=y --configitem CONFIG_KCOV=y
+
+# Specific branch
+debsb build --debian --branch debian/sid
+```
+
+This clones the Debian kernel from `salsa.debian.org/kernel-team/linux.git`, applies config items to `debian/config/config`, and builds the amd64 kernel package using the Debian packaging rules. The resulting kernel is installed into the VM via GRUB.
 
 ### Run the sandbox
 
@@ -96,6 +126,11 @@ This is automatic — no manual mounting needed.
 2. Creates a cloud-init ISO with SSH keys, user config, and auto-login
 3. Boots the VM with QEMU/KVM and waits for cloud-init to finish
 4. On subsequent `debsb run`, boots the prepared image directly
+
+When building with a kernel (`debsb build <path>` or `debsb build --debian`):
+- The kernel `.deb` is installed into the VM
+- GRUB is updated to boot the new kernel by default
+- No `-kernel` or `-initrd` flags needed — GRUB handles boot
 
 ## Accounts
 

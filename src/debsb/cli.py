@@ -1,6 +1,7 @@
 """debsb - Debian Sid Sandbox using QEMU cloud images."""
 
 import argparse
+import glob
 import os
 import shutil
 import socket
@@ -18,10 +19,25 @@ IMAGE_URL = (
 SSH_PORT = 2222
 SSH_KEY = os.path.join(DEBSB_DIR, "id_ed25519")
 
+REQUIRED_CMDS = {
+    "qemu-system-x86_64": "qemu-system-x86",
+    "cloud-localds": "cloud-image-utils",
+    "mkpasswd": "whois",
+    "wget": "wget",
+    "ssh-keygen": "openssh-client",
+}
+
 
 def die(msg):
     print(f"error: {msg}", file=sys.stderr)
     sys.exit(1)
+
+
+def check_deps():
+    missing = [pkg for cmd, pkg in REQUIRED_CMDS.items() if not shutil.which(cmd)]
+    if missing:
+        die(f"missing packages: {' '.join(missing)}\n"
+            f"  Install with: sudo apt install {' '.join(missing)}")
 
 
 def port_in_use(port):
@@ -43,50 +59,103 @@ def cloud_img_path():
     return os.path.join(DEBSB_DIR, f"{IMAGE_NAME}.img")
 
 
-def cmd_build(args):
+def ssh_opts():
+    return ["-i", SSH_KEY, "-p", str(SSH_PORT),
+            "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "BatchMode=yes"]
+
+
+def kill_vm(proc=None, pidfile=None):
+    if proc:
+        proc.kill()
+        proc.wait()
+    elif pidfile and os.path.isfile(pidfile):
+        try:
+            pid = int(Path(pidfile).read_text().strip())
+            os.kill(pid, 9)
+        except (ValueError, OSError):
+            pass
+        os.remove(pidfile)
+
+
+def boot_vm_and_ssh(qcow2, cloud_img, remote_cmd, verbose=False, output_file=None):
+    """Boot VM, wait for SSH, run command as root, shutdown."""
+    if port_in_use(SSH_PORT):
+        die(f"port {SSH_PORT} already in use. Kill the other VM first.")
+
+    vm_cmd = [
+        "qemu-system-x86_64", "-m", "4096", "-smp", "4", "-enable-kvm",
+        "-drive", f"file={qcow2},format=qcow2",
+        "-drive", f"file={cloud_img},format=raw,media=cdrom",
+        "-net", "nic", "-net", f"user,hostfwd=tcp::{SSH_PORT}-:22",
+        "-virtfs", f"local,path={DEBSB_DIR},mount_tag=share,security_model=none",
+        "-display", "none", "-vga", "none",
+    ]
+    pidfile = os.path.join(DEBSB_DIR, "qemu.pid")
+    if verbose:
+        vm_cmd += ["-serial", "mon:stdio"]
+        proc = subprocess.Popen(vm_cmd)
+    else:
+        vm_cmd += ["-serial", "null", "-monitor", "none", "-daemonize",
+                   "-pidfile", pidfile]
+        subprocess.check_call(vm_cmd)
+        proc = None
+
+    try:
+        print("Waiting for SSH...")
+        for _ in range(180):
+            try:
+                subprocess.check_call(
+                    ["ssh"] + ssh_opts() + ["-o", "ConnectTimeout=3", "root@localhost", "true"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                break
+            except (subprocess.CalledProcessError, OSError):
+                time.sleep(2)
+        else:
+            kill_vm(proc, pidfile)
+            die("SSH timeout")
+    except (KeyboardInterrupt, Exception):
+        print("\nInterrupted. Killing VM...")
+        kill_vm(proc, pidfile)
+        sys.exit(1)
+
+    # Run command
+    ssh_cmd = ["ssh"] + ssh_opts() + ["root@localhost"]
+    if output_file:
+        output = subprocess.check_output(ssh_cmd + ["bash", "-c", remote_cmd])
+        Path(output_file).write_bytes(output)
+    else:
+        subprocess.check_call(ssh_cmd + ["bash", "-c", remote_cmd])
+
+    # Shutdown
+    try:
+        subprocess.check_call(ssh_cmd + ["poweroff"],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except (subprocess.CalledProcessError, OSError):
+        pass
+    if proc:
+        proc.wait()
+    else:
+        time.sleep(5)
+
+
+def setup_image(args):
+    """Download cloud image, cloud-init, first boot. Returns when image is ready."""
     os.makedirs(DEBSB_DIR, exist_ok=True)
     qcow2 = qcow2_path()
 
-    # Check existing image
     if os.path.isfile(qcow2):
         if args.reset:
-            sel = 0
+            remove = True
         else:
-            options = ["Reset (delete and rebuild from scratch)",
-                       "Keep current image (do nothing)"]
-            print("Existing image found:")
-            sel = 0
+            print("Existing cloud image found.")
             try:
-                import termios, tty
-                fd = sys.stdin.fileno()
-                old = termios.tcgetattr(fd)
-                tty.setraw(fd)
-                while True:
-                    sys.stdout.write(f"\r\033[K")
-                    for i, opt in enumerate(options):
-                        marker = ">" if i == sel else " "
-                        sys.stdout.write(f"\r\033[K  {marker} {opt}\n")
-                    sys.stdout.write(f"\033[{len(options)}A")
-                    sys.stdout.flush()
-                    ch = sys.stdin.read(1)
-                    if ch == "\x1b":
-                        sys.stdin.read(1)
-                        arrow = sys.stdin.read(1)
-                        if arrow == "A":
-                            sel = max(0, sel - 1)
-                        elif arrow == "B":
-                            sel = min(len(options) - 1, sel + 1)
-                    elif ch in ("\r", "\n"):
-                        break
-                    elif ch == "\x03":
-                        raise KeyboardInterrupt
-                termios.tcsetattr(fd, termios.TCSADRAIN, old)
-                sys.stdout.write("\n" * len(options) + "\r")
-            except (ImportError, termios.error):
-                print("  0) Reset  1) Keep")
-                sel = 0 if input("Choose [0/1]: ").strip() == "0" else 1
+                answer = input("Remove and rebuild from scratch? [y/N]: ").strip().lower()
+            except EOFError:
+                answer = "n"
+            remove = (answer == "y")
 
-        if sel == 0:
+        if remove:
             os.remove(qcow2)
             cloud = cloud_img_path()
             if os.path.isfile(cloud):
@@ -95,7 +164,9 @@ def cmd_build(args):
         else:
             print("Keeping current image.")
             return
-            return
+
+    if os.path.isfile(qcow2):
+        return
 
     # Generate SSH key
     if not os.path.isfile(SSH_KEY):
@@ -115,7 +186,6 @@ def cmd_build(args):
 
     # Cloud-init
     ssh_pubkey = Path(SSH_KEY + ".pub").read_text().strip()
-    # Generate password hash
     passwd_hash = subprocess.check_output(
         ["mkpasswd", "-m", "sha-512", "debian"]
     ).decode().strip()
@@ -160,83 +230,133 @@ def cmd_build(args):
     )
 
     cloud_img = cloud_img_path()
-    subprocess.check_call([
-        "cloud-localds", cloud_img, user_file, meta_file
-    ])
+    subprocess.check_call(["cloud-localds", cloud_img, user_file, meta_file])
     print("Cloud-init image created.")
 
-    # First boot to apply cloud-init
+    # First boot
     print("Running first boot (cloud-init)...")
-    if port_in_use(SSH_PORT):
-        die(f"port {SSH_PORT} already in use. Kill the other VM first.")
-
-    vm_cmd = [
-        "qemu-system-x86_64", "-m", "4096", "-smp", "4", "-enable-kvm",
-        "-drive", f"file={qcow2},format=qcow2",
-        "-drive", f"file={cloud_img},format=raw,media=cdrom",
-        "-net", "nic", "-net", f"user,hostfwd=tcp::{SSH_PORT}-:22",
-        "-display", "none", "-vga", "none",
-    ]
-    pidfile = os.path.join(DEBSB_DIR, "qemu.pid")
-    if args.verbose:
-        vm_cmd += ["-serial", "mon:stdio"]
-        proc = subprocess.Popen(vm_cmd)
-    else:
-        vm_cmd += ["-serial", "null", "-monitor", "none", "-daemonize",
-                   "-pidfile", pidfile]
-        subprocess.check_call(vm_cmd)
-        proc = None
-
-    # Wait for SSH
-    ssh_opts = ["-i", SSH_KEY, "-p", str(SSH_PORT),
-                "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
-                "-o", "BatchMode=yes"]
-
-    def kill_vm():
-        if proc:
-            proc.kill()
-            proc.wait()
-        elif os.path.isfile(pidfile):
-            try:
-                pid = int(Path(pidfile).read_text().strip())
-                os.kill(pid, 9)
-            except (ValueError, OSError):
-                pass
-            os.remove(pidfile)
-
-    try:
-        print("Waiting for SSH...")
-        for _ in range(120):
-            try:
-                subprocess.check_call(
-                    ["ssh"] + ssh_opts + ["-o", "ConnectTimeout=3", "root@localhost", "true"],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                break
-            except (subprocess.CalledProcessError, OSError):
-                time.sleep(2)
-        else:
-            kill_vm()
-            die("SSH timeout during first boot")
-    except (KeyboardInterrupt, Exception):
-        print("\nInterrupted. Killing VM...")
-        kill_vm()
-        sys.exit(1)
-
-    print("Cloud-init done. Shutting down...")
-    try:
-        subprocess.check_call(
-            ["ssh"] + ssh_opts + ["root@localhost", "poweroff"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except (subprocess.CalledProcessError, OSError):
-        pass
-
-    if proc:
-        proc.wait()
-    else:
-        time.sleep(5)
-
+    boot_vm_and_ssh(qcow2, cloud_img,
+                    "cloud-init status --wait --timeout 60 || true",
+                    verbose=args.verbose)
     print(f"Build complete. Image: {qcow2}")
-    print(f"  SSH: ssh -i {SSH_KEY} -p {SSH_PORT} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@localhost")
+
+
+def cmd_build(args):
+    check_deps()
+    setup_image(args)
+
+    if args.debian:
+        from debsb.debian import debian_build
+        debs = debian_build(DEBSB_DIR, args.branch, args.configitem,
+                            verbose=args.verbose, reset=args.reset)
+        if not debs:
+            die("no kernel .deb found after Debian kernel build")
+        # Only install essential packages: base, binary-unsigned, modules
+        install_debs = [d for d in debs
+                        if "dbg" not in d and "headers" not in d and "bpf-dev" not in d]
+        # Move .deb files into ~/.debsb/ for 9p access
+        deb_basenames = []
+        for deb in install_debs:
+            dest = os.path.join(DEBSB_DIR, os.path.basename(deb))
+            if deb != dest:
+                shutil.move(deb, dest)
+            deb_basenames.append(os.path.basename(dest))
+        # Install into VM
+        dpkg_args = " ".join(f"/mnt/debsb/{b}" for b in deb_basenames)
+        print("=== Installing Debian kernel into VM ===")
+        install_script = (
+            "set -e && "
+            f"dpkg -i --force-depends {dpkg_args} && "
+            # New Debian packaging: vmlinuz is at /usr/lib/modules/*/vmlinuz.unsigned
+            # Copy to /boot/ for GRUB detection
+            "KVER=$(ls /usr/lib/modules/ | sort -V | tail -1) && "
+            "if [ -f /usr/lib/modules/$KVER/vmlinuz.unsigned ]; then "
+            "  cp /usr/lib/modules/$KVER/vmlinuz.unsigned /boot/vmlinuz-$KVER; "
+            "fi && "
+            "update-initramfs -c -k $KVER 2>/dev/null || true && "
+            "grub-set-default 0 && update-grub && "
+            "echo INSTALL_OK"
+        )
+        boot_vm_and_ssh(qcow2_path(), cloud_img_path(), install_script,
+                        verbose=args.verbose)
+        print("=== Debian kernel build complete ===")
+        print(f"  Packages: {', '.join(deb_basenames)}")
+        print("  Run with: debsb run")
+        return
+
+    kernel_dir = args.kernel_dir
+    if not kernel_dir:
+        return
+
+    kernel_dir = os.path.abspath(os.path.expanduser(kernel_dir))
+    if not os.path.isfile(os.path.join(kernel_dir, "Makefile")):
+        die(f"not a kernel source tree: {kernel_dir}")
+
+    qcow2 = qcow2_path()
+    cloud_img = cloud_img_path()
+    config_file = os.path.join(kernel_dir, ".config")
+
+    # Step 1: Generate .config if not present
+    if not os.path.isfile(config_file):
+        print("=== Generating default kernel config ===")
+        subprocess.check_call(["make", "defconfig"], cwd=kernel_dir)
+        # Enable 9p for shared filesystem
+        subprocess.check_call(
+            ["./scripts/config", "--enable", "CONFIG_NET_9P_VIRTIO"], cwd=kernel_dir)
+        subprocess.check_call(
+            ["./scripts/config", "--enable", "CONFIG_9P_FS"], cwd=kernel_dir)
+
+    # Step 2: Apply --configitem
+    if args.configitem:
+        for item in args.configitem:
+            key, _, val = item.partition("=")
+            if val:
+                subprocess.check_call(
+                    ["./scripts/config", "--set-val", key, val], cwd=kernel_dir)
+            else:
+                subprocess.check_call(
+                    ["./scripts/config", "--enable", key], cwd=kernel_dir)
+
+    # Step 3: make olddefconfig
+    print("=== Running make olddefconfig ===")
+    subprocess.check_call(["make", "olddefconfig"], cwd=kernel_dir)
+
+    # Step 4: make bindeb-pkg
+    cpus = str(os.cpu_count() or 4)
+    print(f"=== Building kernel (make -j{cpus} bindeb-pkg) ===")
+    env = os.environ.copy()
+    env["MAKEFLAGS"] = f"-j{cpus}"
+    subprocess.check_call(["make", f"-j{cpus}", "bindeb-pkg"], cwd=kernel_dir, env=env)
+
+    # Find linux-image .deb (bindeb-pkg outputs to parent of kernel_dir)
+    parent = os.path.dirname(kernel_dir)
+    debs = [f for f in glob.glob(os.path.join(parent, "linux-image-*.deb"))
+            if "dbg" not in f]
+    if not debs:
+        die("no linux-image .deb found after bindeb-pkg")
+    deb_file = sorted(debs, key=os.path.getmtime)[-1]
+
+    # Move .deb into ~/.debsb/ so it's accessible via 9p share
+    deb_dest = os.path.join(DEBSB_DIR, os.path.basename(deb_file))
+    shutil.move(deb_file, deb_dest)
+    print(f"Using deb: {deb_dest}")
+
+    # Step 5: Install .deb into VM via 9p, update GRUB
+    deb_basename = os.path.basename(deb_dest)
+    print("=== Installing kernel into VM ===")
+    install_script = (
+        "set -e && "
+        "mountpoint -q /mnt/debsb || mount -t 9p -o trans=virtio share /mnt/debsb && "
+        f"dpkg -i /mnt/debsb/{deb_basename} && "
+        "update-initramfs -c -k $(ls /lib/modules/ | sort -V | tail -1) 2>/dev/null || true && "
+        "grub-set-default 0 && update-grub && "
+        "echo INSTALL_OK"
+    )
+    boot_vm_and_ssh(qcow2, cloud_img, install_script, verbose=args.verbose)
+
+    print("=== Kernel build complete ===")
+    print(f"  .deb: {deb_dest}")
+    print("  Run with: debsb run")
 
 
 def cmd_run(args):
@@ -272,13 +392,10 @@ def cmd_run(args):
         subprocess.check_call(cmd)
         user = "root" if args.root else "debian"
         print("VM started. Waiting for SSH...")
-        ssh_opts = ["-i", SSH_KEY, "-p", str(SSH_PORT),
-                    "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
-                    "-o", "BatchMode=yes"]
         for _ in range(90):
             try:
                 subprocess.check_call(
-                    ["ssh"] + ssh_opts + ["-o", "ConnectTimeout=3", f"{user}@localhost", "true"],
+                    ["ssh"] + ssh_opts() + ["-o", "ConnectTimeout=3", f"{user}@localhost", "true"],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 break
             except (subprocess.CalledProcessError, OSError):
@@ -286,15 +403,14 @@ def cmd_run(args):
         else:
             die("SSH timeout")
         if getattr(args, 'exec'):
-            ret = subprocess.call(["ssh"] + ssh_opts + [f"{user}@localhost", getattr(args, 'exec')])
-            subprocess.call(["ssh"] + ssh_opts + [f"{user}@localhost", "poweroff"],
+            ret = subprocess.call(["ssh"] + ssh_opts() + [f"{user}@localhost", getattr(args, 'exec')])
+            subprocess.call(["ssh"] + ssh_opts() + [f"{user}@localhost", "poweroff"],
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             sys.exit(ret)
         print(f"Connecting as {user}...")
         print(f"  Reconnect: ssh -i {SSH_KEY} -p {SSH_PORT} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null {user}@localhost")
-        os.execvp("ssh", ["ssh"] + ssh_opts + [f"{user}@localhost"])
+        os.execvp("ssh", ["ssh"] + ssh_opts() + [f"{user}@localhost"])
     else:
-        # Serial console (default TTY)
         cmd += ["-display", "none", "-vga", "none", "-serial", "mon:stdio"]
         os.execvp(cmd[0], cmd)
 
@@ -303,7 +419,15 @@ def main():
     parser = argparse.ArgumentParser(prog="debsb", description="Debian Sid Sandbox")
     sub = parser.add_subparsers(dest="command")
 
-    p_build = sub.add_parser("build", help="Download and initialize Debian Sid cloud image")
+    p_build = sub.add_parser("build", help="Build sandbox (optionally with kernel)")
+    p_build.add_argument("kernel_dir", nargs="?", default=None,
+                         help="Path to kernel source tree (triggers kernel build)")
+    p_build.add_argument("--debian", action="store_true",
+                         help="Build Debian kernel from salsa.debian.org")
+    p_build.add_argument("--branch", metavar="BRANCH",
+                         help="Salsa branch (default: debian/latest)")
+    p_build.add_argument("--configitem", action="append", default=[],
+                         help="Kernel config item (e.g. CONFIG_KASAN=y). Can be repeated.")
     p_build.add_argument("--size", metavar="SIZE", help="Disk size (default: 20G)")
     p_build.add_argument("--verbose", action="store_true", help="Show VM serial output")
     p_build.add_argument("--reset", action="store_true", help="Reset image without asking")
@@ -311,12 +435,12 @@ def main():
     p_run = sub.add_parser("run", help="Boot the sandbox VM")
     p_run.add_argument("--ssh", action="store_true", help="Boot headless, open SSH session")
     p_run.add_argument("--root", action="store_true", help="Login as root (default: debian user)")
-    p_run.add_argument("--exec", metavar="CMD", help="Boot, run command via SSH, then shutdown (implies --ssh)")
+    p_run.add_argument("--exec", metavar="CMD", help="Boot, run command via SSH, then shutdown")
     p_run.add_argument("--gui", action="store_true", help="Graphical QEMU window")
     p_run.add_argument("--verbose", action="store_true", help="Extra QEMU debug output")
     p_run.add_argument("--append", "-a", action="append", default=[], help="Additional kernel boot options")
     p_run.add_argument("--sound", action="store_true", help="Enable audio device")
-    p_run.add_argument("--graphics", "-g", action="store_true", help="Show graphical output instead of console")
+    p_run.add_argument("--graphics", "-g", action="store_true", help="Show graphical output")
     p_run.add_argument("--qemu-opts", "-o", action="append", default=[], help="Additional QEMU arguments")
 
     args = parser.parse_args()
