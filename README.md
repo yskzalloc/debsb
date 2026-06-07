@@ -4,6 +4,12 @@ Debian Sid sandbox in one command. Downloads a Debian cloud image, boots it in Q
 
 ![debsb tutorial](img/debsb.gif)
 
+## Motivation
+
+I just want a fully hackable Debian setup—both user space and kernel—within a restricted sandbox.
+
+I want to avoid rebuilding an OpenSSH-enabled rootfs for each fuzzing test and repeatedly using the `-kernel` and `-initrd` flags in QEMU.
+
 ## Install
 
 ```bash
@@ -56,7 +62,10 @@ This:
 4. Runs `make olddefconfig` and `make bindeb-pkg`
 5. Installs the resulting `.deb` into the VM via GRUB
 
-### Build with Debian kernel (salsa)
+### Build with [Debian kernel](https://salsa.debian.org/kernel-team/linux)
+
+This kernel image is built based on the official Debian repository.
+- https://salsa.debian.org/kernel-team/linux
 
 ```bash
 # Default branch (debian/latest)
