@@ -66,14 +66,40 @@ def debian_build(debsb_dir, branch, configitems, verbose=False, reset=False):
 
     # Step 3: Download orig tarball
     print("=== Downloading orig tarball ===")
-    env_orig = env.copy()
-    env_orig["USCAN_VCS_EXPORT_UNCOMPRESSED"] = "yes"
-    ret = subprocess.run(["origtargz", "-dt"], cwd=linux_dir, env=env_orig)
-    if ret.returncode != 0:
-        subprocess.check_call(
-            ["uscan", "--download", "--download-current-version",
-             "--no-sign", "--no-symlink"],
-            cwd=linux_dir, env=env_orig)
+    changelog = os.path.join(linux_dir, "debian", "changelog")
+    ver_line = Path(changelog).read_text().split("\n")[0]
+    upstream_ver = ver_line.split("(")[1].split("-")[0]  # e.g. "7.1~rc6"
+    orig_tar_pattern = os.path.join(os.path.dirname(linux_dir),
+                                    f"linux_{upstream_ver}.orig.tar.*")
+    if not glob.glob(orig_tar_pattern):
+        korg_ver = upstream_ver.replace("~", "-")  # 7.1~rc6 -> 7.1-rc6
+        orig_tar = os.path.join(os.path.dirname(linux_dir),
+                                f"linux_{upstream_ver}.orig.tar.xz")
+        # Download from kernel.org
+        url = f"https://git.kernel.org/torvalds/t/linux-{korg_ver}.tar.gz"
+        dl_tar = os.path.join(os.path.dirname(linux_dir), f"linux-{korg_ver}.tar.gz")
+        ret = subprocess.run(["wget", "-q", "-O", dl_tar, url])
+        if ret.returncode != 0:
+            url = f"https://cdn.kernel.org/pub/linux/kernel/v{korg_ver.split('.')[0]}.x/linux-{korg_ver}.tar.xz"
+            dl_tar = os.path.join(os.path.dirname(linux_dir), f"linux-{korg_ver}.tar.xz")
+            subprocess.check_call(["wget", "-q", "-O", dl_tar, url])
+        # Repack: rename top-level dir from linux-7.1-rc6 to linux-7.1~rc6
+        import tempfile
+        tmpdir = tempfile.mkdtemp(dir=os.path.dirname(linux_dir))
+        if dl_tar.endswith(".gz"):
+            subprocess.check_call(["tar", "-xzf", dl_tar, "-C", tmpdir])
+        else:
+            subprocess.check_call(["tar", "-xJf", dl_tar, "-C", tmpdir])
+        extracted = os.path.join(tmpdir, f"linux-{korg_ver}")
+        renamed = os.path.join(tmpdir, f"linux-{upstream_ver}")
+        os.rename(extracted, renamed)
+        subprocess.check_call(["tar", "-cJf", orig_tar,
+                               "-C", tmpdir, f"linux-{upstream_ver}"])
+        shutil.rmtree(tmpdir)
+        os.remove(dl_tar)
+        if not glob.glob(orig_tar_pattern):
+            print(f"error: failed to create orig tarball", file=__import__('sys').stderr)
+            __import__('sys').exit(1)
 
     # Step 4: debian/rules orig (extract upstream + apply quilt patches)
     print("=== debian/rules orig ===")

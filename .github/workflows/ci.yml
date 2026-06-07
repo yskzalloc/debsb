@@ -63,7 +63,7 @@ jobs:
       - name: Verify kernel
         run: debsb run --ssh --root --exec "cd .debsb/; ls -ahl; uname -a; grep CONFIG_KCOV /boot/config-\$(uname -r)"
 
-  debian-sid-clound-image-upstream-debian-installed:
+  debian-sid-clound-image-with-upstream-kernel-deb-pkg-clang-build-installed:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -79,7 +79,41 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y qemu-system-x86 cloud-image-utils whois wget openssh-client \
             build-essential flex bison bc libelf-dev libssl-dev libncurses-dev \
-            dwarves pahole libdw-dev libdwarf-dev kmod \
+            dwarves pahole libdw-dev libdwarf-dev kmod debhelper \
+            clang llvm
+
+      - name: Install debsb
+        run: pip install -e .
+
+      - name: Clone upstream kernel
+        run: git clone --depth 1 https://github.com/torvalds/linux.git
+
+      - name: Build sandbox with upstream kernel
+        run: |
+          export CC=clang
+          debsb build ./linux --configitem CONFIG_KASAN=y --configitem CONFIG_KCOV=y --size 20G --reset --verbose
+
+      - name: Verify kernel
+        run: debsb run --ssh --root --exec "cd .debsb/; ls -ahl; uname -a; grep CONFIG_KCOV /boot/config-\$(uname -r)"
+
+  debian-sid-clound-image-upstream-debian-installed:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Install dependencies
+        run: |
+          sudo add-apt-repository ppa:ubuntu-toolchain-r/test -y
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 cloud-image-utils whois wget openssh-client \
+            build-essential flex bison bc libelf-dev libssl-dev libncurses-dev \
+            dwarves pahole libdw-dev libdwarf-dev kmod gcc-15 \
             python3-dacite python3-debian python3-jinja2 debhelper quilt rsync devscripts dh-python
 
       - name: Install debsb
@@ -90,4 +124,3 @@ jobs:
 
       - name: Verify kernel
         run: debsb run --ssh --root --exec "cd .debsb/; ls -ahl; uname -a; grep CONFIG_KCOV /boot/config-\$(uname -r)"
-
