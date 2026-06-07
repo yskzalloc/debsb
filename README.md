@@ -29,6 +29,11 @@ On Debian/Ubuntu:
 sudo apt install qemu-system-x86 cloud-image-utils whois wget openssh-client
 ```
 
+For upstream kernel builds (`debsb build <path>`), additionally:
+```bash
+sudo apt install build-essential flex bison bc libelf-dev libssl-dev libncurses-dev dwarves pahole libdw-dev libdwarf-dev kmod debhelper
+```
+
 For `--debian` kernel builds, additionally:
 ```bash
 sudo apt install python3-dacite python3-debian python3-jinja2 debhelper quilt rsync devscripts dh-python
