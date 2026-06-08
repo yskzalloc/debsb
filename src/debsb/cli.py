@@ -365,14 +365,16 @@ def cmd_run(args):
     if not os.path.isfile(qcow2):
         die("no image found. Run 'debsb build' first.")
 
-    if port_in_use(SSH_PORT):
+    need_ssh = args.ssh or getattr(args, 'exec')
+
+    if need_ssh and port_in_use(SSH_PORT):
         die(f"port {SSH_PORT} already in use. Is another VM running?")
 
     cmd = [
         "qemu-system-x86_64", "-m", "4096", "-smp", "4", "-enable-kvm",
         "-drive", f"file={qcow2},format=qcow2",
         "-drive", f"file={cloud_img},format=raw,media=cdrom",
-        "-net", "nic", "-net", f"user,hostfwd=tcp::{SSH_PORT}-:22",
+        "-net", "nic", "-net", f"user{',hostfwd=tcp::' + str(SSH_PORT) + '-:22' if need_ssh else ''}",
         "-virtfs", f"local,path={DEBSB_DIR},mount_tag=share,security_model=none",
     ]
 
