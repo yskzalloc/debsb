@@ -5,13 +5,22 @@ on:
     branches: [main]
   pull_request:
   schedule:
-    - cron: '0 4 * * *'
+    - cron: '0 23 * * *'
 
 jobs:
   debian-sid-clound-image-vanilla:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      # First thing after checkout: everything below (toolchains, clones,
+      # sanitizer kernel build, xfstests exports) shares this filesystem,
+      # and a KASAN/KMSAN build with debug info alone can eat 15-25GB.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
 
       - name: Enable KVM
         run: |
@@ -37,6 +46,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      # First thing after checkout: everything below (toolchains, clones,
+      # sanitizer kernel build, xfstests exports) shares this filesystem,
+      # and a KASAN/KMSAN build with debug info alone can eat 15-25GB.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
 
       - name: Enable KVM
         run: |
@@ -67,6 +85,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      # First thing after checkout: everything below (toolchains, clones,
+      # sanitizer kernel build, xfstests exports) shares this filesystem,
+      # and a KASAN/KMSAN build with debug info alone can eat 15-25GB.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
 
       - name: Enable KVM
         run: |
@@ -100,6 +127,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      # First thing after checkout: everything below (toolchains, clones,
+      # sanitizer kernel build, xfstests exports) shares this filesystem,
+      # and a KASAN/KMSAN build with debug info alone can eat 15-25GB.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
 
       - name: Enable KVM
         run: |
