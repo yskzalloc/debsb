@@ -77,10 +77,10 @@ This kernel image is built based on the official Debian repository.
 debsb build --debian --configitem CONFIG_KASAN=y --configitem CONFIG_KCOV=y
 
 # Specific branch
-debsb build --debian --branch debian/sid
+debsb build --debian --branch debian/latest
 ```
 
-This clones the Debian kernel from `salsa.debian.org/kernel-team/linux.git`, applies config items to `debian/config/config`, and builds the amd64 kernel package using the Debian packaging rules. The resulting kernel is installed into the VM via GRUB.
+This clones the Debian kernel from `salsa.debian.org/kernel-team/linux.git` and builds the amd64 kernel package using the Debian packaging rules. `--configitem` entries are written to `debian/config.local/<arch>/config.<arch>` — the official local-override mechanism of the Debian kernel packaging (see its `debian/README.source`, "Kernel config files") — which merges after all stock config files and therefore wins, without modifying any git-tracked file. The resulting kernel is installed into the VM via GRUB.
 
 ### Run the sandbox
 
