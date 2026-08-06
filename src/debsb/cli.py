@@ -122,10 +122,10 @@ def boot_vm_and_ssh(qcow2, cloud_img, remote_cmd, verbose=False, output_file=Non
     # Run command
     ssh_cmd = ["ssh"] + ssh_opts() + ["root@localhost"]
     if output_file:
-        output = subprocess.check_output(ssh_cmd + ["bash", "-c", remote_cmd])
+        output = subprocess.check_output(ssh_cmd + [remote_cmd])
         Path(output_file).write_bytes(output)
     else:
-        subprocess.check_call(ssh_cmd + ["bash", "-c", remote_cmd])
+        subprocess.check_call(ssh_cmd + [remote_cmd])
 
     # Shutdown
     try:
