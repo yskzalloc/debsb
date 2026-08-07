@@ -236,7 +236,7 @@ def setup_image(args):
     # First boot
     print("Running first boot (cloud-init)...")
     boot_vm_and_ssh(qcow2, cloud_img,
-                    "cloud-init status --wait --timeout 60 || true",
+                    "timeout 300 cloud-init status --wait || true",
                     verbose=args.verbose)
     print(f"Build complete. Image: {qcow2}")
 
