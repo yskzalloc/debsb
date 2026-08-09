@@ -1,0 +1,191 @@
+name: CI (arm64)
+
+# Separate from ci.yml because arm64 GitHub runners do not expose /dev/kvm.
+# The guests therefore run under TCG emulation, which is several times slower
+# than the KVM-accelerated amd64 jobs -- keeping them in their own workflow
+# stops that latency from gating the x86_64 checks.
+#
+# debsb detects the missing /dev/kvm on its own and falls back to TCG,
+# tripling its SSH boot budget; nothing here has to opt in.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '0 23 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: ci-arm64-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  debian-sid-clound-image-vanilla-arm64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      # First thing after checkout: everything below (toolchains, clones,
+      # sanitizer kernel build, xfstests exports) shares this filesystem,
+      # and a KASAN/KMSAN build with debug info alone can eat 15-25GB.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+
+      # Informational only.  These runners have no KVM today; the udev rule is
+      # kept so the jobs pick acceleration up automatically if that changes.
+      - name: Report KVM availability
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules || true
+          sudo udevadm trigger --name-match=kvm || true
+          ls -l /dev/kvm || echo "no KVM on this runner: debsb will use TCG"
+
+      # qemu-efi-aarch64 provides AAVMF; arm64 guests boot via UEFI.
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-arm qemu-efi-aarch64 \
+            cloud-image-utils whois wget openssh-client
+
+      - name: Install debsb
+        run: pip install -e .
+
+      - name: Build sandbox
+        run: debsb build --size 10G --reset --verbose
+
+      - name: Run test
+        run: debsb run --ssh --root --exec "cd .debsb/; ls -ahl; uname -a"
+
+  debian-sid-clound-image-with-upstream-kernel-deb-pkg-installed-arm64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      # First thing after checkout: everything below (toolchains, clones,
+      # sanitizer kernel build, xfstests exports) shares this filesystem,
+      # and a KASAN/KMSAN build with debug info alone can eat 15-25GB.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+
+      - name: Report KVM availability
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules || true
+          sudo udevadm trigger --name-match=kvm || true
+          ls -l /dev/kvm || echo "no KVM on this runner: debsb will use TCG"
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-arm qemu-efi-aarch64 \
+            cloud-image-utils whois wget openssh-client \
+            build-essential flex bison bc libelf-dev libssl-dev libncurses-dev \
+            dwarves pahole libdw-dev libdwarf-dev kmod debhelper
+
+      - name: Install debsb
+        run: pip install -e .
+
+      - name: Clone upstream kernel
+        run: git clone --depth 1 https://github.com/torvalds/linux.git
+
+      - name: Build sandbox with upstream kernel
+        run: debsb build ./linux --configitem CONFIG_KASAN=y --configitem CONFIG_KCOV=y --size 20G --reset --verbose
+
+      - name: Verify kernel
+        run: debsb run --ssh --root --exec "cd .debsb/; ls -ahl; uname -a; grep CONFIG_KCOV /boot/config-\$(uname -r)"
+
+  debian-sid-clound-image-with-upstream-kernel-deb-pkg-clang-build-installed-arm64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      # First thing after checkout: everything below (toolchains, clones,
+      # sanitizer kernel build, xfstests exports) shares this filesystem,
+      # and a KASAN/KMSAN build with debug info alone can eat 15-25GB.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+
+      - name: Report KVM availability
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules || true
+          sudo udevadm trigger --name-match=kvm || true
+          ls -l /dev/kvm || echo "no KVM on this runner: debsb will use TCG"
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-arm qemu-efi-aarch64 \
+            cloud-image-utils whois wget openssh-client \
+            build-essential flex bison bc libelf-dev libssl-dev libncurses-dev \
+            dwarves pahole libdw-dev libdwarf-dev kmod debhelper \
+            clang llvm
+
+      - name: Install debsb
+        run: pip install -e .
+
+      - name: Clone upstream kernel
+        run: git clone --depth 1 https://github.com/torvalds/linux.git
+
+      - name: Build sandbox with upstream kernel
+        run: |
+          export CC=clang
+          debsb build ./linux --configitem CONFIG_KASAN=y --configitem CONFIG_KCOV=y --size 20G --reset --verbose
+
+      - name: Verify kernel
+        run: debsb run --ssh --root --exec "cd .debsb/; ls -ahl; uname -a; grep CONFIG_KCOV /boot/config-\$(uname -r)"
+
+  debian-sid-clound-image-upstream-debian-installed-arm64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      # First thing after checkout: everything below (toolchains, clones,
+      # sanitizer kernel build, xfstests exports) shares this filesystem,
+      # and a KASAN/KMSAN build with debug info alone can eat 15-25GB.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+
+      - name: Report KVM availability
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules || true
+          sudo udevadm trigger --name-match=kvm || true
+          ls -l /dev/kvm || echo "no KVM on this runner: debsb will use TCG"
+
+      # gcc-arm-linux-gnueabihf is an arm64-only build dependency of the Debian
+      # kernel: the arm64 flavour builds a 32-bit compat vDSO with
+      # CROSS_COMPILE_COMPAT=arm-linux-gnueabihf-.  Without it the build fails
+      # at arch/arm64/kernel/vdso32/note.o.
+      - name: Install dependencies
+        run: |
+          sudo add-apt-repository ppa:ubuntu-toolchain-r/test -y
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-arm qemu-efi-aarch64 \
+            cloud-image-utils whois wget openssh-client \
+            build-essential flex bison bc libelf-dev libssl-dev libncurses-dev \
+            dwarves pahole libdw-dev libdwarf-dev kmod gcc-15 \
+            gcc-arm-linux-gnueabihf \
+            python3-dacite python3-debian python3-jinja2 debhelper quilt rsync devscripts dh-python
+
+      - name: Install debsb
+        run: pip install -e .
+
+      - name: Build sandbox with Debian kernel
+        run: debsb build --debian --configitem CONFIG_KASAN=y --configitem CONFIG_KCOV=y --size 20G --reset --verbose
+
+      - name: Verify kernel
+        run: debsb run --ssh --root --exec "cd .debsb/; ls -ahl; uname -a; grep CONFIG_KCOV /boot/config-\$(uname -r)"

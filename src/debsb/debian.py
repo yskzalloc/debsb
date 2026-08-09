@@ -127,7 +127,10 @@ def _ensure_orig_tarball(linux_dir, upstream_ver):
 
 
 def debian_build(debsb_dir, branch, configitems, verbose=False, reset=False):
-    """Clone Debian kernel from salsa, apply configitems, build amd64 .deb packages.
+    """Clone Debian kernel from salsa, apply configitems, build host-arch .deb packages.
+
+    <arch> below is the host dpkg architecture (amd64 or arm64); both use the
+    'none' featureset and a flavour named after the architecture.
 
     Steps:
       1. git clone --depth 1 -b <branch> from salsa into ~/.debsb/linux
@@ -135,7 +138,7 @@ def debian_build(debsb_dir, branch, configitems, verbose=False, reset=False):
       3. Generate debian/control + rules.gen
       4. Ensure orig tarball, debian/rules orig (also regenerates rules.gen)
       5. debian/rules source + setup
-      6. DEB_RULES_REQUIRES_ROOT=no make -f debian/rules.gen binary-arch_amd64_none_amd64
+      6. DEB_RULES_REQUIRES_ROOT=no make -f debian/rules.gen binary-arch_<arch>_none_<arch>
 
     Returns path to the linux-image .deb file.
     """

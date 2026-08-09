@@ -16,17 +16,30 @@ I want to avoid rebuilding an OpenSSH-enabled rootfs for each fuzzing test and r
 pip install debsb
 ```
 
+### Architectures
+
+`amd64` (x86_64) and `arm64` (aarch64) hosts are supported. debsb always builds
+a sandbox for the host architecture — it picks the matching Debian cloud image,
+QEMU binary and machine type automatically, and there is no cross-build mode.
+KVM is used when `/dev/kvm` is available and TCG emulation otherwise.
+
 ### Dependencies
 
-- `qemu-system-x86_64` (with KVM support)
+- `qemu-system-x86_64` or `qemu-system-aarch64` (KVM support recommended)
+- `qemu-efi-aarch64` — arm64 only, the guest boots via UEFI
 - `cloud-image-utils` (`cloud-localds`)
 - `whois` (`mkpasswd`)
 - `wget`
 - `ssh`
 
-On Debian/Ubuntu:
+On Debian/Ubuntu, amd64:
 ```bash
 sudo apt install qemu-system-x86 cloud-image-utils whois wget openssh-client
+```
+
+On Debian/Ubuntu, arm64:
+```bash
+sudo apt install qemu-system-arm qemu-efi-aarch64 cloud-image-utils whois wget openssh-client
 ```
 
 For upstream kernel builds (`debsb build <path>`), additionally:
@@ -37,6 +50,13 @@ sudo apt install build-essential flex bison bc libelf-dev libssl-dev libncurses-
 For `--debian` kernel builds, additionally:
 ```bash
 sudo apt install python3-dacite python3-debian python3-jinja2 debhelper quilt rsync devscripts dh-python
+```
+
+On arm64, `--debian` also needs the armhf cross compiler. The Debian arm64 kernel
+builds a 32-bit compat vDSO (`CROSS_COMPILE_COMPAT=arm-linux-gnueabihf-`), which
+its `debian/control` declares as an arm64-only build dependency:
+```bash
+sudo apt install gcc-arm-linux-gnueabihf
 ```
 
 ## Usage
@@ -80,7 +100,7 @@ debsb build --debian --configitem CONFIG_KASAN=y --configitem CONFIG_KCOV=y
 debsb build --debian --branch debian/latest
 ```
 
-This clones the Debian kernel from `salsa.debian.org/kernel-team/linux.git` and builds the amd64 kernel package using the Debian packaging rules. `--configitem` entries are written to `debian/config.local/<arch>/config.<arch>` — the official local-override mechanism of the Debian kernel packaging (see its `debian/README.source`, "Kernel config files") — which merges after all stock config files and therefore wins, without modifying any git-tracked file. The resulting kernel is installed into the VM via GRUB.
+This clones the Debian kernel from `salsa.debian.org/kernel-team/linux.git` and builds the host-architecture kernel package (`binary-arch_<arch>_none_<arch>`) using the Debian packaging rules. `--configitem` entries are written to `debian/config.local/<arch>/config.<arch>` — the official local-override mechanism of the Debian kernel packaging (see its `debian/README.source`, "Kernel config files") — which merges after all stock config files and therefore wins, without modifying any git-tracked file. The resulting kernel is installed into the VM via GRUB.
 
 ### Run the sandbox
 
@@ -136,10 +156,20 @@ This is automatic — no manual mounting needed.
 
 ## How it works
 
-1. Downloads `debian-sid-generic-amd64-daily.qcow2` from cloud.debian.org
+1. Downloads `debian-sid-generic-<arch>-daily.qcow2` from cloud.debian.org
 2. Creates a cloud-init ISO with SSH keys, user config, and auto-login
 3. Boots the VM with QEMU/KVM and waits for cloud-init to finish
 4. On subsequent `debsb run`, boots the prepared image directly
+
+Per-architecture differences are handled internally:
+
+| | amd64 | arm64 |
+|---|---|---|
+| QEMU | `qemu-system-x86_64` | `qemu-system-aarch64 -machine virt` |
+| Firmware | SeaBIOS (built in) | AAVMF/edk2 via pflash, with a writable var store in `~/.debsb/AAVMF_VARS.fd` |
+| Disks | IDE (`/dev/sda`), cloud-init seed as CD-ROM | virtio (`/dev/vda`), cloud-init seed as a virtio disk |
+| Serial console | `ttyS0` | `ttyAMA0` |
+| Graphics (`--graphics`) | `-vga virtio` | `virtio-gpu-pci` |
 
 When building with a kernel (`debsb build <path>` or `debsb build --debian`):
 - The kernel `.deb` is installed into the VM

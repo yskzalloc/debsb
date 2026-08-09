@@ -3,6 +3,7 @@
 import argparse
 import glob
 import os
+import platform
 import shutil
 import socket
 import subprocess
@@ -11,16 +12,77 @@ import time
 from pathlib import Path
 
 DEBSB_DIR = os.path.join(str(Path.home()), ".debsb")
-IMAGE_NAME = "debian-sid-generic-amd64-daily"
+
+# Debian architecture name -> everything that differs between guests.  Only the
+# host architecture is ever used: debsb builds kernels natively and boots with
+# KVM, so cross-architecture emulation is out of scope.
+ARCHES = {
+    "amd64": {
+        "qemu": "qemu-system-x86_64",
+        "qemu_pkg": "qemu-system-x86",
+        # i440fx default machine, SeaBIOS, IDE disks -- no extra flags needed.
+        "machine": [],
+        # The default qemu64/host model already works under both KVM and TCG.
+        "cpu_kvm": None,
+        "cpu_tcg": None,
+        "console": "ttyS0",
+        # -drive without if= lands on the IDE bus, so the cloud image is sda.
+        "disk_opts": "",
+        "seed_opts": "media=cdrom",
+        "root_dev": "/dev/sda",
+        "nic": "nic",
+        "gfx": ["-vga", "virtio"],
+    },
+    "arm64": {
+        "qemu": "qemu-system-aarch64",
+        "qemu_pkg": "qemu-system-arm",
+        # 'virt' has no default machine on aarch64 and no legacy buses: the
+        # guest boots off UEFI (see uefi_args) with virtio disks.
+        "machine": ["-machine", "virt"],
+        # 'virt' defaults to the 32-bit cortex-a15, which KVM rejects outright;
+        # a CPU model is mandatory here, unlike on amd64.
+        "cpu_kvm": "host",
+        "cpu_tcg": "max",
+        "console": "ttyAMA0",
+        "disk_opts": "if=virtio",
+        "seed_opts": "if=virtio",
+        "root_dev": "/dev/vda",
+        "nic": "nic,model=virtio-net-pci",
+        "gfx": ["-device", "virtio-gpu-pci"],
+    },
+}
+
+# AAVMF (edk2) firmware, needed to boot the arm64 cloud image.  Debian/Ubuntu
+# ship it in qemu-efi-aarch64, Fedora in edk2-aarch64.
+AAVMF_CODE = [
+    "/usr/share/AAVMF/AAVMF_CODE.fd",
+    "/usr/share/qemu-efi-aarch64/QEMU_EFI.fd",
+    "/usr/share/edk2/aarch64/QEMU_EFI.fd",
+]
+AAVMF_VARS = [
+    "/usr/share/AAVMF/AAVMF_VARS.fd",
+    "/usr/share/qemu-efi-aarch64/QEMU_VARS.fd",
+    "/usr/share/edk2/aarch64/vars-template-pflash.raw",
+]
+
+
+def _host_arch():
+    """Map uname machine to the Debian architecture name."""
+    return {"x86_64": "amd64", "aarch64": "arm64"}.get(platform.machine(), platform.machine())
+
+
+ARCH = _host_arch()
+SPEC = ARCHES.get(ARCH)
+
+IMAGE_NAME = f"debian-sid-generic-{ARCH}-daily"
 IMAGE_URL = (
     "https://cloud.debian.org/images/cloud/sid/daily/latest/"
-    "debian-sid-generic-amd64-daily.qcow2"
+    f"{IMAGE_NAME}.qcow2"
 )
 SSH_PORT = 2222
 SSH_KEY = os.path.join(DEBSB_DIR, "id_ed25519")
 
 REQUIRED_CMDS = {
-    "qemu-system-x86_64": "qemu-system-x86",
     "cloud-localds": "cloud-image-utils",
     "mkpasswd": "whois",
     "wget": "wget",
@@ -33,11 +95,79 @@ def die(msg):
     sys.exit(1)
 
 
+def check_arch():
+    if SPEC is None:
+        die(f"unsupported architecture: {platform.machine()} "
+            f"(supported: {', '.join(sorted(ARCHES))})")
+
+
 def check_deps():
-    missing = [pkg for cmd, pkg in REQUIRED_CMDS.items() if not shutil.which(cmd)]
+    check_arch()
+    required = dict(REQUIRED_CMDS, **{SPEC["qemu"]: SPEC["qemu_pkg"]})
+    missing = [pkg for cmd, pkg in required.items() if not shutil.which(cmd)]
     if missing:
         die(f"missing packages: {' '.join(missing)}\n"
             f"  Install with: sudo apt install {' '.join(missing)}")
+    if ARCH == "arm64" and not _first_existing(AAVMF_CODE):
+        die("no AAVMF/edk2 firmware found; arm64 guests boot via UEFI.\n"
+            "  Install with: sudo apt install qemu-efi-aarch64")
+
+
+def _first_existing(paths):
+    return next((p for p in paths if os.path.isfile(p)), None)
+
+
+def kvm_available():
+    return os.access("/dev/kvm", os.R_OK | os.W_OK)
+
+
+def uefi_args():
+    """pflash pair for UEFI guests: read-only firmware + writable var store.
+
+    The var store has to be a per-sandbox copy, otherwise GRUB cannot persist
+    its boot entry and every boot falls back to the removable media path.
+    """
+    if ARCH != "arm64":
+        return []
+    code = _first_existing(AAVMF_CODE)
+    if not code:
+        die("no AAVMF/edk2 firmware found; install qemu-efi-aarch64")
+    varstore = os.path.join(DEBSB_DIR, "AAVMF_VARS.fd")
+    if not os.path.isfile(varstore):
+        template = _first_existing(AAVMF_VARS)
+        if template:
+            shutil.copyfile(template, varstore)
+        else:
+            # Same geometry as the code image; edk2 formats it on first boot.
+            with open(varstore, "wb") as f:
+                f.truncate(os.path.getsize(code))
+    return [
+        "-drive", f"if=pflash,format=raw,unit=0,readonly=on,file={code}",
+        "-drive", f"if=pflash,format=raw,unit=1,file={varstore}",
+    ]
+
+
+def qemu_cmd(qcow2, cloud_img, hostfwd):
+    """Base QEMU invocation shared by the first-boot, install and run paths."""
+    def drive(path, fmt, extra):
+        return f"file={path},format={fmt}" + (f",{extra}" if extra else "")
+
+    cmd = [SPEC["qemu"], "-m", "4096", "-smp", "4"] + SPEC["machine"]
+    kvm = kvm_available()
+    if kvm:
+        cmd += ["-enable-kvm"]
+    cpu = SPEC["cpu_kvm"] if kvm else SPEC["cpu_tcg"]
+    if cpu:
+        cmd += ["-cpu", cpu]
+    cmd += uefi_args()
+    cmd += [
+        "-drive", drive(qcow2, "qcow2", SPEC["disk_opts"]),
+        "-drive", drive(cloud_img, "raw", SPEC["seed_opts"]),
+        "-net", SPEC["nic"],
+        "-net", f"user,hostfwd=tcp::{SSH_PORT}-:22" if hostfwd else "user",
+        "-virtfs", f"local,path={DEBSB_DIR},mount_tag=share,security_model=none",
+    ]
+    return cmd
 
 
 def port_in_use(port):
@@ -65,6 +195,11 @@ def ssh_opts():
             "-o", "BatchMode=yes"]
 
 
+def ssh_attempts(n):
+    """Boot budget in 2s polls; TCG guests need several times longer than KVM."""
+    return n if kvm_available() else n * 3
+
+
 def kill_vm(proc=None, pidfile=None):
     if proc:
         proc.kill()
@@ -83,12 +218,7 @@ def boot_vm_and_ssh(qcow2, cloud_img, remote_cmd, verbose=False, output_file=Non
     if port_in_use(SSH_PORT):
         die(f"port {SSH_PORT} already in use. Kill the other VM first.")
 
-    vm_cmd = [
-        "qemu-system-x86_64", "-m", "4096", "-smp", "4", "-enable-kvm",
-        "-drive", f"file={qcow2},format=qcow2",
-        "-drive", f"file={cloud_img},format=raw,media=cdrom",
-        "-net", "nic", "-net", f"user,hostfwd=tcp::{SSH_PORT}-:22",
-        "-virtfs", f"local,path={DEBSB_DIR},mount_tag=share,security_model=none",
+    vm_cmd = qemu_cmd(qcow2, cloud_img, hostfwd=True) + [
         "-display", "none", "-vga", "none",
     ]
     pidfile = os.path.join(DEBSB_DIR, "qemu.pid")
@@ -103,7 +233,7 @@ def boot_vm_and_ssh(qcow2, cloud_img, remote_cmd, verbose=False, output_file=Non
 
     try:
         print("Waiting for SSH...")
-        for _ in range(180):
+        for _ in range(ssh_attempts(180)):
             try:
                 subprocess.check_call(
                     ["ssh"] + ssh_opts() + ["-o", "ConnectTimeout=3", "root@localhost", "true"],
@@ -157,9 +287,11 @@ def setup_image(args):
 
         if remove:
             os.remove(qcow2)
-            cloud = cloud_img_path()
-            if os.path.isfile(cloud):
-                os.remove(cloud)
+            # The UEFI var store outlives the disk it points at, so drop it too
+            # and let edk2 re-enroll boot entries against the fresh image.
+            for extra in (cloud_img_path(), os.path.join(DEBSB_DIR, "AAVMF_VARS.fd")):
+                if os.path.isfile(extra):
+                    os.remove(extra)
             print("Image removed. Rebuilding...")
         else:
             print("Keeping current image.")
@@ -190,6 +322,8 @@ def setup_image(args):
         ["mkpasswd", "-m", "sha-512", "debian"]
     ).decode().strip()
 
+    console = SPEC["console"]
+    root_dev = SPEC["root_dev"]
     meta_file = os.path.join(DEBSB_DIR, "meta-data")
     user_file = os.path.join(DEBSB_DIR, "user-data")
     Path(meta_file).write_text("")
@@ -214,12 +348,12 @@ def setup_image(args):
         "runcmd:\n"
         "  - sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config\n"
         "  - systemctl restart ssh\n"
-        "  - growpart /dev/sda 1 || true\n"
-        "  - resize2fs /dev/sda1 || true\n"
-        "  - mkdir -p /etc/systemd/system/serial-getty@ttyS0.service.d\n"
-        "  - printf '[Service]\\nExecStart=\\nExecStart=-/sbin/agetty --autologin debian --noclear %%I 115200 linux\\n' > /etc/systemd/system/serial-getty@ttyS0.service.d/autologin.conf\n"
+        f"  - growpart {root_dev} 1 || true\n"
+        f"  - resize2fs {root_dev}1 || true\n"
+        f"  - mkdir -p /etc/systemd/system/serial-getty@{console}.service.d\n"
+        f"  - printf '[Service]\\nExecStart=\\nExecStart=-/sbin/agetty --autologin debian --noclear %%I 115200 linux\\n' > /etc/systemd/system/serial-getty@{console}.service.d/autologin.conf\n"
         "  - systemctl daemon-reload\n"
-        "  - systemctl restart serial-getty@ttyS0.service\n"
+        f"  - systemctl restart serial-getty@{console}.service\n"
         "  - sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT=\"quiet loglevel=0\"/' /etc/default/grub\n"
         "  - update-grub\n"
         "  - mkdir -p /mnt/debsb\n"
@@ -300,11 +434,11 @@ def cmd_build(args):
     if not os.path.isfile(config_file):
         print("=== Generating default kernel config ===")
         subprocess.check_call(["make", "defconfig"], cwd=kernel_dir)
-        # Enable 9p for shared filesystem
-        subprocess.check_call(
-            ["./scripts/config", "--enable", "CONFIG_NET_9P_VIRTIO"], cwd=kernel_dir)
-        subprocess.check_call(
-            ["./scripts/config", "--enable", "CONFIG_9P_FS"], cwd=kernel_dir)
+        # Enable 9p for shared filesystem.  CONFIG_NET_9P is =m in the arm64
+        # defconfig and unset in x86_64's, so enable it too -- olddefconfig
+        # would otherwise drop the =y transport that depends on it.
+        for opt in ("CONFIG_NET_9P", "CONFIG_NET_9P_VIRTIO", "CONFIG_9P_FS"):
+            subprocess.check_call(["./scripts/config", "--enable", opt], cwd=kernel_dir)
 
     # Step 2: Apply --configitem
     if args.configitem:
@@ -360,6 +494,7 @@ def cmd_build(args):
 
 
 def cmd_run(args):
+    check_arch()
     qcow2 = qcow2_path()
     cloud_img = cloud_img_path()
     if not os.path.isfile(qcow2):
@@ -370,13 +505,7 @@ def cmd_run(args):
     if need_ssh and port_in_use(SSH_PORT):
         die(f"port {SSH_PORT} already in use. Is another VM running?")
 
-    cmd = [
-        "qemu-system-x86_64", "-m", "4096", "-smp", "4", "-enable-kvm",
-        "-drive", f"file={qcow2},format=qcow2",
-        "-drive", f"file={cloud_img},format=raw,media=cdrom",
-        "-net", "nic", "-net", f"user{',hostfwd=tcp::' + str(SSH_PORT) + '-:22' if need_ssh else ''}",
-        "-virtfs", f"local,path={DEBSB_DIR},mount_tag=share,security_model=none",
-    ]
+    cmd = qemu_cmd(qcow2, cloud_img, hostfwd=need_ssh)
 
     if args.sound:
         cmd += ["-device", "intel-hda", "-device", "hda-duplex"]
@@ -386,7 +515,7 @@ def cmd_run(args):
         cmd += opt.split()
 
     if args.gui or args.graphics:
-        cmd += ["-display", "gtk", "-vga", "virtio"]
+        cmd += ["-display", "gtk"] + SPEC["gfx"]
         os.execvp(cmd[0], cmd)
     elif getattr(args, 'exec') or args.ssh:
         cmd += ["-display", "none", "-vga", "none",
@@ -394,7 +523,7 @@ def cmd_run(args):
         subprocess.check_call(cmd)
         user = "root" if args.root else "debian"
         print("VM started. Waiting for SSH...")
-        for _ in range(90):
+        for _ in range(ssh_attempts(90)):
             try:
                 subprocess.check_call(
                     ["ssh"] + ssh_opts() + ["-o", "ConnectTimeout=3", f"{user}@localhost", "true"],
