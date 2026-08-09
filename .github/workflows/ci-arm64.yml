@@ -129,7 +129,7 @@ jobs:
             cloud-image-utils whois wget openssh-client \
             build-essential flex bison bc libelf-dev libssl-dev libncurses-dev \
             dwarves pahole libdw-dev libdwarf-dev kmod debhelper \
-            clang llvm
+            clang llvm lld
 
       - name: Install debsb
         run: pip install -e .
@@ -137,13 +137,17 @@ jobs:
       - name: Clone upstream kernel
         run: git clone --depth 1 https://github.com/torvalds/linux.git
 
+      # LLVM=1 selects clang plus ld.lld/llvm-ar/llvm-nm.  It must reach make as
+      # a command-line assignment -- debsb forwards LLVM/CC/HOSTCC from the
+      # environment for exactly this reason.  A bare `export CC=clang` does not
+      # work: Kbuild assigns CC in the Makefile, which outranks the environment.
       - name: Build sandbox with upstream kernel
         run: |
-          export CC=clang
+          export LLVM=1
           debsb build ./linux --configitem CONFIG_KASAN=y --configitem CONFIG_KCOV=y --size 20G --reset --verbose
 
       - name: Verify kernel
-        run: debsb run --ssh --root --exec "cd .debsb/; ls -ahl; uname -a; grep CONFIG_KCOV /boot/config-\$(uname -r)"
+        run: debsb run --ssh --root --exec "cd .debsb/; ls -ahl; uname -a; grep -E 'CONFIG_KCOV=|CONFIG_CC_IS_CLANG=' /boot/config-\$(uname -r)"
 
   debian-sid-clound-image-upstream-debian-installed-arm64:
     runs-on: ubuntu-24.04-arm

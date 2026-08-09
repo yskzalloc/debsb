@@ -147,6 +147,20 @@ def uefi_args():
     ]
 
 
+KERNEL_MAKE_VARS = ("LLVM", "CC", "HOSTCC")
+
+
+def kernel_make_vars():
+    """Toolchain overrides to pass to make as command-line assignments.
+
+    Kbuild assigns CC/HOSTCC in the Makefile, and GNU make lets a makefile
+    assignment win over the environment -- so `export CC=clang` alone has no
+    effect and the build silently falls back to gcc.  Only a command-line
+    assignment (or LLVM=1) actually switches the compiler.
+    """
+    return [f"{v}={os.environ[v]}" for v in KERNEL_MAKE_VARS if os.environ.get(v)]
+
+
 def qemu_cmd(qcow2, cloud_img, hostfwd):
     """Base QEMU invocation shared by the first-boot, install and run paths."""
     def drive(path, fmt, extra):
@@ -195,9 +209,47 @@ def ssh_opts():
             "-o", "BatchMode=yes"]
 
 
-def ssh_attempts(n):
-    """Boot budget in 2s polls; TCG guests need several times longer than KVM."""
-    return n if kvm_available() else n * 3
+def serial_log_path():
+    return os.path.join(DEBSB_DIR, "serial.log")
+
+
+def ssh_budget(kvm_secs):
+    """Seconds to wait for a guest to answer SSH.
+
+    A TCG guest boots several times slower than a KVM one, and a freshly
+    installed KASAN kernel slower still -- the arm64 CI runners have no
+    /dev/kvm, so this is the difference between a green job and a timeout.
+    DEBSB_SSH_TIMEOUT overrides both figures for anything slower yet.
+    """
+    override = os.environ.get("DEBSB_SSH_TIMEOUT")
+    if override:
+        return int(override)
+    return kvm_secs if kvm_available() else kvm_secs * 6
+
+
+def dump_serial(path, lines=50):
+    """Print the tail of the guest console, so a timeout says why it timed out."""
+    if not path or not os.path.isfile(path):
+        return
+    tail = Path(path).read_bytes().decode("utf-8", "replace").splitlines()
+    print(f"--- last {min(lines, len(tail))} lines of {path} ---", file=sys.stderr)
+    for line in tail[-lines:]:
+        print(line, file=sys.stderr)
+
+
+def wait_for_ssh(user, budget, serial_log=None):
+    """Poll until the guest answers SSH. True on success, False on timeout."""
+    deadline = time.monotonic() + budget
+    while time.monotonic() < deadline:
+        try:
+            subprocess.check_call(
+                ["ssh"] + ssh_opts() + ["-o", "ConnectTimeout=3", f"{user}@localhost", "true"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
+        except (subprocess.CalledProcessError, OSError):
+            time.sleep(2)
+    dump_serial(serial_log)
+    return False
 
 
 def kill_vm(proc=None, pidfile=None):
@@ -226,24 +278,19 @@ def boot_vm_and_ssh(qcow2, cloud_img, remote_cmd, verbose=False, output_file=Non
         vm_cmd += ["-serial", "mon:stdio"]
         proc = subprocess.Popen(vm_cmd)
     else:
-        vm_cmd += ["-serial", "null", "-monitor", "none", "-daemonize",
-                   "-pidfile", pidfile]
+        # Capture the console instead of discarding it: without this a boot
+        # that never reaches sshd fails with no clue as to why.
+        vm_cmd += ["-serial", f"file:{serial_log_path()}", "-monitor", "none",
+                   "-daemonize", "-pidfile", pidfile]
         subprocess.check_call(vm_cmd)
         proc = None
 
     try:
         print("Waiting for SSH...")
-        for _ in range(ssh_attempts(180)):
-            try:
-                subprocess.check_call(
-                    ["ssh"] + ssh_opts() + ["-o", "ConnectTimeout=3", "root@localhost", "true"],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                break
-            except (subprocess.CalledProcessError, OSError):
-                time.sleep(2)
-        else:
+        budget = ssh_budget(900)
+        if not wait_for_ssh("root", budget, None if verbose else serial_log_path()):
             kill_vm(proc, pidfile)
-            die("SSH timeout")
+            die(f"SSH timeout after {budget}s")
     except (KeyboardInterrupt, Exception):
         print("\nInterrupted. Killing VM...")
         kill_vm(proc, pidfile)
@@ -430,10 +477,19 @@ def cmd_build(args):
     cloud_img = cloud_img_path()
     config_file = os.path.join(kernel_dir, ".config")
 
+    # Toolchain selection has to reach make as command-line assignments: the
+    # kernel Makefile assigns CC/HOSTCC itself, and a makefile assignment beats
+    # an environment variable, so a plain `export CC=clang` is silently ignored.
+    # These are applied to the config steps too, otherwise CONFIG_CC_IS_CLANG
+    # and the options gated on it resolve against the wrong compiler.
+    toolchain = kernel_make_vars()
+    if toolchain:
+        print(f"=== Toolchain: {' '.join(toolchain)} ===")
+
     # Step 1: Generate .config if not present
     if not os.path.isfile(config_file):
         print("=== Generating default kernel config ===")
-        subprocess.check_call(["make", "defconfig"], cwd=kernel_dir)
+        subprocess.check_call(["make"] + toolchain + ["defconfig"], cwd=kernel_dir)
         # Enable 9p for shared filesystem.  CONFIG_NET_9P is =m in the arm64
         # defconfig and unset in x86_64's, so enable it too -- olddefconfig
         # would otherwise drop the =y transport that depends on it.
@@ -453,14 +509,17 @@ def cmd_build(args):
 
     # Step 3: make olddefconfig
     print("=== Running make olddefconfig ===")
-    subprocess.check_call(["make", "olddefconfig"], cwd=kernel_dir)
+    subprocess.check_call(["make"] + toolchain + ["olddefconfig"], cwd=kernel_dir)
 
     # Step 4: make bindeb-pkg
     cpus = str(os.cpu_count() or 4)
     print(f"=== Building kernel (make -j{cpus} bindeb-pkg) ===")
     env = os.environ.copy()
-    env["MAKEFLAGS"] = f"-j{cpus}"
-    subprocess.check_call(["make", f"-j{cpus}", "bindeb-pkg"], cwd=kernel_dir, env=env)
+    # Append rather than overwrite: a caller's MAKEFLAGS may carry real options.
+    env["MAKEFLAGS"] = " ".join(
+        f for f in (os.environ.get("MAKEFLAGS", ""), f"-j{cpus}") if f)
+    subprocess.check_call(["make", f"-j{cpus}"] + toolchain + ["bindeb-pkg"],
+                          cwd=kernel_dir, env=env)
 
     # Find linux-image .deb (bindeb-pkg outputs to parent of kernel_dir)
     parent = os.path.dirname(kernel_dir)
@@ -518,21 +577,21 @@ def cmd_run(args):
         cmd += ["-display", "gtk"] + SPEC["gfx"]
         os.execvp(cmd[0], cmd)
     elif getattr(args, 'exec') or args.ssh:
+        # Same budget as the install boot in boot_vm_and_ssh: this path boots a
+        # just-installed kernel, which is the slower of the two, so it must not
+        # be the stingier of the two.  The pidfile is what lets a timeout clean
+        # up after itself rather than leaving a daemonized QEMU behind.
+        pidfile = os.path.join(DEBSB_DIR, "qemu.pid")
         cmd += ["-display", "none", "-vga", "none",
-                "-serial", "null", "-monitor", "none", "-daemonize"]
+                "-serial", f"file:{serial_log_path()}", "-monitor", "none",
+                "-daemonize", "-pidfile", pidfile]
         subprocess.check_call(cmd)
         user = "root" if args.root else "debian"
         print("VM started. Waiting for SSH...")
-        for _ in range(ssh_attempts(90)):
-            try:
-                subprocess.check_call(
-                    ["ssh"] + ssh_opts() + ["-o", "ConnectTimeout=3", f"{user}@localhost", "true"],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                break
-            except (subprocess.CalledProcessError, OSError):
-                time.sleep(2)
-        else:
-            die("SSH timeout")
+        budget = ssh_budget(900)
+        if not wait_for_ssh(user, budget, serial_log_path()):
+            kill_vm(pidfile=pidfile)
+            die(f"SSH timeout after {budget}s")
         if getattr(args, 'exec'):
             ret = subprocess.call(["ssh"] + ssh_opts() + [f"{user}@localhost", getattr(args, 'exec')])
             subprocess.call(["ssh"] + ssh_opts() + [f"{user}@localhost", "poweroff"],

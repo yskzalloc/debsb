@@ -87,6 +87,15 @@ This:
 4. Runs `make olddefconfig` and `make bindeb-pkg`
 5. Installs the resulting `.deb` into the VM via GRUB
 
+To build with clang, set `LLVM=1` (or `CC`/`HOSTCC`) in the environment — debsb
+forwards these to `make` as command-line assignments, which is the only form
+Kbuild honours:
+```bash
+LLVM=1 debsb build ~/linux --configitem CONFIG_KASAN=y
+```
+`LLVM=1` also selects `ld.lld`/`llvm-ar`/`llvm-nm`, so install `clang llvm lld`.
+Confirm it took effect with `CONFIG_CC_IS_CLANG=y` in the built kernel's config.
+
 ### Build with [Debian kernel](https://salsa.debian.org/kernel-team/linux)
 
 This kernel image is built based on the official Debian repository.
