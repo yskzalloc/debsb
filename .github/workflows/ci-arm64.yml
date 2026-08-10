@@ -5,8 +5,12 @@ name: CI (arm64)
 # than the KVM-accelerated amd64 jobs -- keeping them in their own workflow
 # stops that latency from gating the x86_64 checks.
 #
-# debsb detects the missing /dev/kvm on its own and falls back to TCG,
-# tripling its SSH boot budget; nothing here has to opt in.
+# debsb detects the missing /dev/kvm on its own and falls back to TCG.  It
+# also serialises the vCPUs there: multi-threaded TCG, which QEMU picks by
+# default when host and guest share an architecture, wedges these guests
+# part-way through cloud-init and no boot budget can rescue that.  The budget
+# still matters for the post-install boot of a KASAN kernel, and
+# DEBSB_SSH_TIMEOUT below pins it for these runners.
 
 on:
   push:
@@ -19,6 +23,15 @@ on:
 concurrency:
   group: ci-arm64-${{ github.ref }}
   cancel-in-progress: true
+
+# Per boot ATTEMPT, not per job: debsb boots the guest again if the first one
+# never answers, so the worst case is twice this.  An hour looks generous until
+# you watch a KASAN kernel boot under emulation -- one was still 900s into its
+# initramfs and had not reached cloud-init's network stage by 1600s.  The
+# sanitizer instruments every memory access, and TCG then emulates every one of
+# those checks, so these guests are slower than anything KVM ever sees.
+env:
+  DEBSB_SSH_TIMEOUT: '3600'
 
 jobs:
   debian-sid-clound-image-vanilla-arm64:
@@ -60,6 +73,12 @@ jobs:
       - name: Run test
         run: debsb run --ssh --root --exec "cd .debsb/; ls -ahl; uname -a"
 
+      # A guest that never reaches sshd is otherwise invisible: debsb prints
+      # the tail itself, this shows the whole console for the boot that failed.
+      - name: Guest console on failure
+        if: failure()
+        run: tail -n 400 ~/.debsb/serial.log || echo "no serial log captured"
+
   debian-sid-clound-image-with-upstream-kernel-deb-pkg-installed-arm64:
     runs-on: ubuntu-24.04-arm
     steps:
@@ -100,6 +119,10 @@ jobs:
 
       - name: Verify kernel
         run: debsb run --ssh --root --exec "cd .debsb/; ls -ahl; uname -a; grep CONFIG_KCOV /boot/config-\$(uname -r)"
+
+      - name: Guest console on failure
+        if: failure()
+        run: tail -n 400 ~/.debsb/serial.log || echo "no serial log captured"
 
   debian-sid-clound-image-with-upstream-kernel-deb-pkg-clang-build-installed-arm64:
     runs-on: ubuntu-24.04-arm
@@ -149,6 +172,10 @@ jobs:
       - name: Verify kernel
         run: debsb run --ssh --root --exec "cd .debsb/; ls -ahl; uname -a; grep -E 'CONFIG_KCOV=|CONFIG_CC_IS_CLANG=' /boot/config-\$(uname -r)"
 
+      - name: Guest console on failure
+        if: failure()
+        run: tail -n 400 ~/.debsb/serial.log || echo "no serial log captured"
+
   debian-sid-clound-image-upstream-debian-installed-arm64:
     runs-on: ubuntu-24.04-arm
     steps:
@@ -193,3 +220,7 @@ jobs:
 
       - name: Verify kernel
         run: debsb run --ssh --root --exec "cd .debsb/; ls -ahl; uname -a; grep CONFIG_KCOV /boot/config-\$(uname -r)"
+
+      - name: Guest console on failure
+        if: failure()
+        run: tail -n 400 ~/.debsb/serial.log || echo "no serial log captured"

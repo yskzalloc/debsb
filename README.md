@@ -21,7 +21,11 @@ pip install debsb
 `amd64` (x86_64) and `arm64` (aarch64) hosts are supported. debsb always builds
 a sandbox for the host architecture — it picks the matching Debian cloud image,
 QEMU binary and machine type automatically, and there is no cross-build mode.
-KVM is used when `/dev/kvm` is available and TCG emulation otherwise.
+KVM is used when `/dev/kvm` is available and TCG emulation otherwise. A TCG
+guest boots several times slower, so debsb scales how long it waits for SSH;
+`DEBSB_SSH_TIMEOUT=<seconds>` overrides that budget. The guest console is
+recorded to `~/.debsb/serial.log`, and its tail is printed if a guest never
+comes up.
 
 ### Dependencies
 

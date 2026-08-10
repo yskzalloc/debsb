@@ -187,6 +187,11 @@ def qemu_cmd(qcow2, cloud_img, hostfwd):
 def port_in_use(port):
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
+        # Without SO_REUSEADDR the sockets left in TIME_WAIT by the previous
+        # guest's SSH session make the port look taken for a minute or so, so
+        # a 'debsb run' straight after a 'debsb build' would refuse to start.
+        # With it, the bind still fails if something is really listening.
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind(("127.0.0.1", port))
         return False
     except OSError:
@@ -207,6 +212,10 @@ def ssh_opts():
     return ["-i", SSH_KEY, "-p", str(SSH_PORT),
             "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
             "-o", "BatchMode=yes"]
+
+
+# A wedged unaccelerated guest never recovers, so one retry beats one long wait.
+BOOT_ATTEMPTS = 2
 
 
 def serial_log_path():
@@ -265,6 +274,66 @@ def kill_vm(proc=None, pidfile=None):
         os.remove(pidfile)
 
 
+def ssh_run(remote_cmd, user="root", capture=False, attempts=5):
+    """Run a command in the guest, retrying connections the guest tore down.
+
+    cloud-init restarts sshd while the guest is still coming up, so the first
+    connection made after it starts answering can be reset mid-handshake.  ssh
+    reports a transport failure as exit 255, which is distinguishable from the
+    remote command's own exit status -- only the former is worth retrying.
+    """
+    ssh_cmd = ["ssh"] + ssh_opts() + [f"{user}@localhost", remote_cmd]
+    for attempt in range(1, attempts + 1):
+        proc = subprocess.run(ssh_cmd, capture_output=capture)
+        if proc.returncode != 255:
+            if proc.returncode:
+                raise subprocess.CalledProcessError(proc.returncode, ssh_cmd)
+            return proc.stdout
+        if attempt < attempts:
+            print(f"ssh connection reset by the guest; retrying "
+                  f"({attempt}/{attempts})")
+            time.sleep(5)
+    raise subprocess.CalledProcessError(255, ssh_cmd)
+
+
+def start_vm(vm_cmd, verbose, pidfile):
+    """Launch QEMU. Returns the Popen for a foreground guest, None if daemonized."""
+    if verbose:
+        return subprocess.Popen(vm_cmd + ["-serial", "mon:stdio"])
+    # Capture the console instead of discarding it: without this a boot that
+    # never reaches sshd fails with no clue as to why.
+    subprocess.check_call(vm_cmd + [
+        "-serial", f"file:{serial_log_path()}", "-monitor", "none",
+        "-daemonize", "-pidfile", pidfile])
+    return None
+
+
+def boot_until_ssh(vm_cmd, user, verbose, pidfile):
+    """Boot the guest and wait for sshd, booting again if it never arrives.
+
+    An unaccelerated guest intermittently wedges part-way through cloud-init:
+    it goes idle, the console falls silent and sshd is never reached.  Nothing
+    on this side provokes it and nothing clears it, so the only cure is to
+    shoot the guest and start over -- which usually succeeds.
+    """
+    budget = ssh_budget(900)
+    for attempt in range(1, BOOT_ATTEMPTS + 1):
+        proc = start_vm(vm_cmd, verbose, pidfile)
+        try:
+            up = wait_for_ssh(user, budget, None if verbose else serial_log_path())
+        except (KeyboardInterrupt, Exception):
+            print("\nInterrupted. Killing VM...")
+            kill_vm(proc, pidfile)
+            sys.exit(1)
+        if up:
+            return proc
+        kill_vm(proc, pidfile)
+        print(f"error: guest never reached SSH in {budget}s "
+              f"(attempt {attempt}/{BOOT_ATTEMPTS})", file=sys.stderr)
+        time.sleep(2)
+    die(f"SSH timeout: {BOOT_ATTEMPTS} boots of {budget}s each never came up")
+
+
 def boot_vm_and_ssh(qcow2, cloud_img, remote_cmd, verbose=False, output_file=None):
     """Boot VM, wait for SSH, run command as root, shutdown."""
     if port_in_use(SSH_PORT):
@@ -274,37 +343,17 @@ def boot_vm_and_ssh(qcow2, cloud_img, remote_cmd, verbose=False, output_file=Non
         "-display", "none", "-vga", "none",
     ]
     pidfile = os.path.join(DEBSB_DIR, "qemu.pid")
-    if verbose:
-        vm_cmd += ["-serial", "mon:stdio"]
-        proc = subprocess.Popen(vm_cmd)
-    else:
-        # Capture the console instead of discarding it: without this a boot
-        # that never reaches sshd fails with no clue as to why.
-        vm_cmd += ["-serial", f"file:{serial_log_path()}", "-monitor", "none",
-                   "-daemonize", "-pidfile", pidfile]
-        subprocess.check_call(vm_cmd)
-        proc = None
-
-    try:
-        print("Waiting for SSH...")
-        budget = ssh_budget(900)
-        if not wait_for_ssh("root", budget, None if verbose else serial_log_path()):
-            kill_vm(proc, pidfile)
-            die(f"SSH timeout after {budget}s")
-    except (KeyboardInterrupt, Exception):
-        print("\nInterrupted. Killing VM...")
-        kill_vm(proc, pidfile)
-        sys.exit(1)
+    print("Waiting for SSH...")
+    proc = boot_until_ssh(vm_cmd, "root", verbose, pidfile)
 
     # Run command
-    ssh_cmd = ["ssh"] + ssh_opts() + ["root@localhost"]
     if output_file:
-        output = subprocess.check_output(ssh_cmd + [remote_cmd])
-        Path(output_file).write_bytes(output)
+        Path(output_file).write_bytes(ssh_run(remote_cmd, capture=True))
     else:
-        subprocess.check_call(ssh_cmd + [remote_cmd])
+        ssh_run(remote_cmd)
 
     # Shutdown
+    ssh_cmd = ["ssh"] + ssh_opts() + ["root@localhost"]
     try:
         subprocess.check_call(ssh_cmd + ["poweroff"],
                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -401,8 +450,24 @@ def setup_image(args):
         f"  - printf '[Service]\\nExecStart=\\nExecStart=-/sbin/agetty --autologin debian --noclear %%I 115200 linux\\n' > /etc/systemd/system/serial-getty@{console}.service.d/autologin.conf\n"
         "  - systemctl daemon-reload\n"
         f"  - systemctl restart serial-getty@{console}.service\n"
-        "  - sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT=\"quiet loglevel=0\"/' /etc/default/grub\n"
+        # Pin the console instead of inheriting whatever the image had.  arm64
+        # gets one for free from the virt machine's DT stdout-path, but amd64
+        # has no such thing, so without this the guest has no kernel console at
+        # all once cloud-init has rewritten the cmdline.  'loglevel=0' used to
+        # go with 'quiet' here and silenced every message a stuck boot might
+        # have printed; 'quiet' alone still lets warnings and oopses through.
+        # tty0 stays first so --graphics keeps showing boot output; the serial
+        # console is last, which is what makes it /dev/console.
+        # systemd gives a device 90s to show up before failing its mount unit.
+        # A sanitizer kernel on an emulated CPU can still be in the initramfs
+        # at that point, so /boot/efi times out, local-fs.target fails and the
+        # guest lands in emergency mode with sshd never started.  The device
+        # does appear, just far later than systemd's default patience.
+        f"  - sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT=\"quiet console=tty0 console={console},115200 systemd.default_device_timeout_sec=900\"/' /etc/default/grub\n"
         "  - update-grub\n"
+        # Belt and braces for the same failure: /boot/efi is not needed to boot
+        # or to reach sshd, so it must never be the reason the guest stops.
+        "  - sed -i -E 's|^([^#]\\S*\\s+/boot/efi\\s+\\S+\\s+)(\\S+)|\\1\\2,nofail|' /etc/fstab\n"
         "  - mkdir -p /mnt/debsb\n"
         "  - echo 'share /mnt/debsb 9p trans=virtio,nofail 0 0' >> /etc/fstab\n"
         "  - mount /mnt/debsb\n"
@@ -410,8 +475,31 @@ def setup_image(args):
         "  - ln -sf /mnt/debsb /home/debian/.debsb\n"
     )
 
+    # Ship an explicit network config rather than letting cloud-init guess.
+    # Its fallback picks an interface by looking for one with a carrier, which
+    # races with the link coming up: lose that race and nothing is configured,
+    # the NIC stays down and sshd is unreachable even though the guest boots
+    # perfectly.  The glob has to be e* rather than en*: predictable names
+    # (enp0s1 on virt, enp0s3 on i440fx) are applied by udev, and a guest slow
+    # enough for udev to still be settling keeps the kernel's own eth0 -- which
+    # is exactly the guest that needs the config most.  'optional' keeps
+    # systemd-networkd-wait-online from failing the boot if DHCP is slow,
+    # which it is on an unaccelerated guest.
+    net_file = os.path.join(DEBSB_DIR, "network-config")
+    Path(net_file).write_text(
+        "version: 2\n"
+        "ethernets:\n"
+        "  primary:\n"
+        "    match:\n"
+        "      name: \"e*\"\n"
+        "    dhcp4: true\n"
+        "    dhcp6: false\n"
+        "    optional: true\n"
+    )
+
     cloud_img = cloud_img_path()
-    subprocess.check_call(["cloud-localds", cloud_img, user_file, meta_file])
+    subprocess.check_call(["cloud-localds", "-N", net_file,
+                           cloud_img, user_file, meta_file])
     print("Cloud-init image created.")
 
     # First boot
@@ -582,16 +670,10 @@ def cmd_run(args):
         # be the stingier of the two.  The pidfile is what lets a timeout clean
         # up after itself rather than leaving a daemonized QEMU behind.
         pidfile = os.path.join(DEBSB_DIR, "qemu.pid")
-        cmd += ["-display", "none", "-vga", "none",
-                "-serial", f"file:{serial_log_path()}", "-monitor", "none",
-                "-daemonize", "-pidfile", pidfile]
-        subprocess.check_call(cmd)
+        cmd += ["-display", "none", "-vga", "none"]
         user = "root" if args.root else "debian"
-        print("VM started. Waiting for SSH...")
-        budget = ssh_budget(900)
-        if not wait_for_ssh(user, budget, serial_log_path()):
-            kill_vm(pidfile=pidfile)
-            die(f"SSH timeout after {budget}s")
+        print("Starting VM. Waiting for SSH...")
+        boot_until_ssh(cmd, user, False, pidfile)
         if getattr(args, 'exec'):
             ret = subprocess.call(["ssh"] + ssh_opts() + [f"{user}@localhost", getattr(args, 'exec')])
             subprocess.call(["ssh"] + ssh_opts() + [f"{user}@localhost", "poweroff"],
