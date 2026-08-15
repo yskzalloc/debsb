@@ -31,7 +31,7 @@ concurrency:
 # sanitizer instruments every memory access, and TCG then emulates every one of
 # those checks, so these guests are slower than anything KVM ever sees.
 env:
-  DEBSB_SSH_TIMEOUT: '3600'
+  DEBSB_SSH_TIMEOUT: '7200'
 
 jobs:
   debian-sid-clound-image-vanilla-arm64:

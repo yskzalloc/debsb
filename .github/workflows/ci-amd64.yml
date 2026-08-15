@@ -76,7 +76,8 @@ jobs:
         run: git clone --depth 1 https://github.com/torvalds/linux.git
 
       - name: Build sandbox with upstream kernel
-        run: debsb build ./linux --size 10G --verbose \
+        run: |
+          debsb build ./linux --size 10G --verbose \
               `# --- boot without an initrd (built-in for both qemu and crosvm) ---` \
               --configitem CONFIG_VIRTIO=y \
               --configitem CONFIG_VIRTIO_PCI=y \
@@ -222,7 +223,8 @@ jobs:
         run: pip install -e .
 
       - name: Build sandbox with Debian kernel
-        run: debsb build --debian --size 10G --verbose \
+        run: |
+          debsb build --debian --size 10G --verbose \
               `# --- boot without an initrd (built-in for both qemu and crosvm) ---` \
               --configitem CONFIG_VIRTIO=y \
               --configitem CONFIG_VIRTIO_PCI=y \
