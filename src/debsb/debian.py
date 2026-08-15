@@ -232,8 +232,12 @@ def debian_build(debsb_dir, branch, configitems, verbose=False, reset=False):
     env["DEB_RULES_REQUIRES_ROOT"] = "no"
     build_start = os.path.join(linux_dir, ".debsb_build_marker")
     Path(build_start).touch()
+    # Build only the _base sub-target: it produces the kernel image + modules
+    # debs we need. The full aggregate also builds _installer (debian-installer
+    # udebs), which fails for a fuzzing kernel that has ext4/virtio built-in
+    # (=y) rather than as modules, and which we never use.
     subprocess.check_call(
-        ["make", "-f", "debian/rules.gen", f"binary-arch_{arch}_none_{arch}"],
+        ["make", "-f", "debian/rules.gen", f"binary-arch_{arch}_none_{arch}_base"],
         cwd=linux_dir, env=env)
 
     # Find the kernel .deb files newer than build start
