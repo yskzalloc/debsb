@@ -111,7 +111,7 @@ jobs:
               --configitem CONFIG_NET_NS=y
 
       - name: Verify kernel
-        run: debsb run --ssh --root --exec "cd .debsb/; ls -ahl; uname -a; grep CONFIG_KCOV /boot/config-\$(uname -r)"
+        run: debsb run --ssh --root --exec "cd .debsb/; ls -ahl; uname -a; grep CONFIG_KCOV /usr/lib/modules/\$(uname -r)/config 2>/dev/null || grep CONFIG_KCOV /boot/config-\$(uname -r)"
 
   debian-sid-clound-image-with-upstream-kernel-deb-pkg-clang-build-installed:
     runs-on: ubuntu-latest
@@ -188,7 +188,7 @@ jobs:
               --configitem CONFIG_NET_NS=y
 
       - name: Verify kernel
-        run: debsb run --ssh --root --exec "cd .debsb/; ls -ahl; uname -a; grep -E 'CONFIG_KCOV=|CONFIG_CC_IS_CLANG=' /boot/config-\$(uname -r)"
+        run: debsb run --ssh --root --exec "cd .debsb/; ls -ahl; uname -a; grep -E 'CONFIG_KCOV=|CONFIG_CC_IS_CLANG=' /usr/lib/modules/\$(uname -r)/config 2>/dev/null || grep -E 'CONFIG_KCOV=|CONFIG_CC_IS_CLANG=' /boot/config-\$(uname -r)"
 
   debian-sid-clound-image-upstream-debian-installed:
     runs-on: ubuntu-latest
@@ -258,4 +258,4 @@ jobs:
               --configitem CONFIG_NET_NS=y
 
       - name: Verify kernel
-        run: debsb run --ssh --root --exec "cd .debsb/; ls -ahl; uname -a; grep CONFIG_KCOV /boot/config-\$(uname -r)"
+        run: debsb run --ssh --root --exec "cd .debsb/; ls -ahl; uname -a; grep CONFIG_KCOV /usr/lib/modules/\$(uname -r)/config 2>/dev/null || grep CONFIG_KCOV /boot/config-\$(uname -r)"
