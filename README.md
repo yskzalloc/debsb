@@ -18,14 +18,42 @@ pip install debsb
 
 ### Architectures
 
-`amd64` (x86_64) and `arm64` (aarch64) hosts are supported. debsb always builds
-a sandbox for the host architecture — it picks the matching Debian cloud image,
-QEMU binary and machine type automatically, and there is no cross-build mode.
-KVM is used when `/dev/kvm` is available and TCG emulation otherwise. A TCG
-guest boots several times slower, so debsb scales how long it waits for SSH;
+`amd64` (x86_64) and `arm64` (aarch64) are supported, both as the host and as
+the target. By default debsb builds a sandbox for the host architecture — it
+picks the matching Debian cloud image, QEMU binary and machine type
+automatically. KVM is used when `/dev/kvm` is available and TCG emulation
+otherwise.
+
+#### Cross-architecture mode (`--arch`)
+
+Pass `--arch amd64` or `--arch arm64` to `build` and `run` to target an
+architecture that differs from the host, e.g. an arm64 guest on an x86_64
+machine:
+
+```bash
+debsb build --arch arm64 --size 10G
+debsb run   --arch arm64 --ssh --root --exec "uname -a"
+```
+
+When the target differs from the host, debsb boots the guest under **TCG
+emulation** — KVM cannot execute a foreign instruction set, so it is skipped
+even if `/dev/kvm` exists. Any kernel is cross-compiled: debsb forwards
+`ARCH=` and `CROSS_COMPILE=` to Kbuild (and drives the Debian packaging's
+`DEB_HOST_ARCH`/`CROSS_COMPILE` cross-build for `--debian`), so you need the
+matching cross toolchain (`gcc-aarch64-linux-gnu` for an arm64 target, or
+`LLVM=1` clang, which cross-compiles natively).
+
+A TCG guest boots several times slower than a KVM one, and a cross-emulated
+guest slower still, so debsb scales how long it waits for SSH;
 `DEBSB_SSH_TIMEOUT=<seconds>` overrides that budget. The guest console is
 recorded to `~/.debsb/serial.log`, and its tail is printed if a guest never
 comes up.
+
+> **arm64 serial console:** the arm64 `virt` machine's console is the PL011
+> UART (`ttyAMA0`). A guest kernel must have `CONFIG_SERIAL_AMBA_PL011=y` and
+> `CONFIG_SERIAL_AMBA_PL011_CONSOLE=y`, or the serial console — and therefore
+> `~/.debsb/serial.log` — stays empty. debsb pins both on for arm64 kernel
+> builds so a failed boot always leaves something in the log.
 
 ### Dependencies
 

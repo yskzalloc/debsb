@@ -2,6 +2,7 @@
 
 import glob
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -11,6 +12,88 @@ from pathlib import Path
 
 SALSA_URL = "https://salsa.debian.org/kernel-team/linux.git"
 DEFAULT_BRANCH = "debian/latest"
+
+
+def _installed_gcc_version(cross_prefix=""):
+    """Newest installed gcc major version for the given toolchain prefix.
+
+    Looks for {cross_prefix}gcc-N on PATH (e.g. gcc-16, aarch64-linux-gnu-gcc-15)
+    and returns the highest N, or None if only an unversioned gcc is present.
+    """
+    best = None
+    seen = set()
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        if not d or d in seen or not os.path.isdir(d):
+            continue
+        seen.add(d)
+        for name in os.listdir(d):
+            prefix = f"{cross_prefix}gcc-"
+            if name.startswith(prefix) and name[len(prefix):].isdigit():
+                ver = int(name[len(prefix):])
+                if best is None or ver > best:
+                    best = ver
+    return best
+
+
+def _align_kernel_compiler(linux_dir, cross_prefix=""):
+    """Point debian/config/defines.toml's c_compiler at an installed gcc.
+
+    The Debian kernel pins an exact compiler (e.g. c_compiler = 'gcc-16') and
+    bakes {DEB_HOST_GNU_TYPE}-gcc-16 into rules.gen.  On a runner that only has
+    an older gcc, Kconfig fails with "C compiler ' <triplet>-gcc-16' not found".
+    Rewrite the pin to the newest gcc actually installed (matching the target's
+    cross prefix) so the build uses a compiler that exists; if the pinned one
+    is present, or none can be resolved, leave the file untouched.
+    """
+    defines = Path(linux_dir, "debian", "config", "defines.toml")
+    if not defines.is_file():
+        return
+    text = defines.read_text()
+    m = re.search(r"^(\s*c_compiler\s*=\s*)'gcc-(\d+)'\s*$", text, re.MULTILINE)
+    if not m:
+        return
+    pinned = int(m.group(2))
+    # If the exact pinned gcc exists for this toolchain, nothing to do.
+    if shutil.which(f"{cross_prefix}gcc-{pinned}"):
+        return
+    have = _installed_gcc_version(cross_prefix)
+    if have == pinned:
+        return
+    if have is not None:
+        replacement = f"gcc-{have}"
+    elif shutil.which(f"{cross_prefix}gcc"):
+        # No versioned compiler, but an unversioned {triplet}-gcc exists (common
+        # for cross packages like gcc-aarch64-linux-gnu): pin to that.
+        replacement = "gcc"
+    else:
+        return
+    new_text = text[:m.start()] + f"{m.group(1)}'{replacement}'\n" + text[m.end():]
+    defines.write_text(new_text)
+    print(f"=== Kernel pins gcc-{pinned}, which is not installed; "
+          f"using {replacement} instead ===")
+
+
+def _disable_dtb_build(linux_dir, arch):
+    """Turn off the Debian packaging's device-tree build for <arch>.
+
+    The arm64 flavour sets enable_dtb = true, which makes the packaging run
+    `make dtbs` and compile the entire arch/<arch>/boot/dts tree.  debsb boots
+    the guest on QEMU's 'virt' machine, which supplies its own device tree, so
+    those DTBs are never used -- and a single unbuildable board DTB in a fresh
+    rc kernel (e.g. x1p64100-microsoft-denali) then fails the whole package.
+    Flipping the flag to false skips the DTB build entirely: faster, and it
+    removes a class of failures that has nothing to do with the guest kernel.
+    """
+    defines = Path(linux_dir, "debian", "config", arch, "defines.toml")
+    if not defines.is_file():
+        return
+    text = defines.read_text()
+    new_text, n = re.subn(r"^(\s*enable_dtb\s*=\s*)true\s*$",
+                          r"\1false", text, flags=re.MULTILINE)
+    if n:
+        defines.write_text(new_text)
+        print(f"=== Disabling {arch} DTB build "
+              f"(unused: the QEMU virt machine supplies its own DT) ===")
 
 
 def _host_arch():
@@ -126,11 +209,16 @@ def _ensure_orig_tarball(linux_dir, upstream_ver):
         os.remove(dl_tar)
 
 
-def debian_build(debsb_dir, branch, configitems, verbose=False, reset=False):
-    """Clone Debian kernel from salsa, apply configitems, build host-arch .deb packages.
+def debian_build(debsb_dir, branch, configitems, verbose=False, reset=False,
+                 arch=None, cross=False):
+    """Clone Debian kernel from salsa, apply configitems, build .deb packages.
 
-    <arch> below is the host dpkg architecture (amd64 or arm64); both use the
-    'none' featureset and a flavour named after the architecture.
+    <arch> is the target dpkg architecture (amd64 or arm64); it defaults to the
+    host's.  Both use the 'none' featureset and a flavour named after the
+    architecture.  When <cross> is true the target differs from the host and the
+    build is cross-compiled: dpkg's DEB_HOST_ARCH/CROSS_COMPILE machinery is
+    driven so the arm64 flavour is produced on an x86_64 runner (and vice
+    versa).
 
     Steps:
       1. git clone --depth 1 -b <branch> from salsa into ~/.debsb/linux
@@ -148,6 +236,25 @@ def debian_build(debsb_dir, branch, configitems, verbose=False, reset=False):
     env = os.environ.copy()
     env["MAKEFLAGS"] = f"-j{cpus}"
     env["DEB_BUILD_OPTIONS"] = f"terse parallel={cpus}"
+
+    arch = arch or _host_arch()
+    if cross:
+        # Debian kernel packaging honours CROSS_COMPILE and cross-builds when
+        # DEB_HOST_ARCH differs from DEB_BUILD_ARCH.  Setting DEB_HOST_ARCH is
+        # what flips gencontrol.py and rules.gen into cross mode; CROSS_COMPILE
+        # then points Kbuild at the target's gcc.  The build architecture stays
+        # the host's so all build-time helpers still run natively.
+        triplet = {"amd64": "x86_64-linux-gnu-",
+                   "arm64": "aarch64-linux-gnu-"}[arch]
+        env["DEB_HOST_ARCH"] = arch
+        env["CROSS_COMPILE"] = triplet
+        # The compat 32-bit vDSO of the arm64 flavour needs the armhf gcc; the
+        # Debian control lists it as an arm64 build-dep, and cross builds still
+        # invoke it under CROSS_COMPILE_COMPAT.
+        if arch == "arm64":
+            env["CROSS_COMPILE_COMPAT"] = "arm-linux-gnueabihf-"
+        print(f"=== Cross-building {arch} on {_host_arch()} "
+              f"(CROSS_COMPILE={triplet}) ===")
 
     # Step 1: Clone
     if os.path.isdir(linux_dir):
@@ -181,11 +288,19 @@ def debian_build(debsb_dir, branch, configitems, verbose=False, reset=False):
     # flavour-level file config.local/<arch>/config.<arch> merges last, so it
     # overrides all stock config files — but it must exist before
     # debian/control and rules.gen are generated.
-    arch = _host_arch()
     local_dir = os.path.join(linux_dir, "debian", "config.local")
     shutil.rmtree(local_dir, ignore_errors=True)  # drop overrides of prior runs
     # Undo the tracked-file appends made by debsb < 0.2.4 on reused clones
     subprocess.run(["git", "checkout", "--", "debian/config"], cwd=linux_dir)
+    # The arm64 guest's console is the virt machine's PL011 UART: pin it on so
+    # the serial console (and ~/.debsb/serial.log) works.  The stock Debian
+    # arm64 config already sets these =y; making them explicit guarantees a
+    # visible boot even if a --configitem or a future config change touches it.
+    if arch == "arm64":
+        configitems = list(configitems) + [
+            "CONFIG_SERIAL_AMBA_PL011=y",
+            "CONFIG_SERIAL_AMBA_PL011_CONSOLE=y",
+        ]
     if configitems:
         flavour_conf = os.path.join(local_dir, arch, f"config.{arch}")
         os.makedirs(os.path.dirname(flavour_conf))
@@ -196,6 +311,22 @@ def debian_build(debsb_dir, branch, configitems, verbose=False, reset=False):
                 f.write(f"{item}\n")
                 if verbose:
                     print(f"  + {item}")
+
+    # Align the pinned compiler with what the runner actually has.  The Debian
+    # kernel hardcodes c_compiler = 'gcc-<N>' (baked into rules.gen as
+    # {triplet}-gcc-<N>); if that exact version is not installed the Kconfig
+    # step fails.  For a cross build the compiler carries the target triplet,
+    # so match against that prefix.  Must run before debian/control so the
+    # value propagates into rules.gen.
+    gcc_prefix = {"amd64": "x86_64-linux-gnu-",
+                  "arm64": "aarch64-linux-gnu-"}[arch] if cross else ""
+    _align_kernel_compiler(linux_dir, gcc_prefix)
+
+    # The guest boots on QEMU's virt machine, which provides its own device
+    # tree, so the packaged DTBs are unused; skip building them (also dodges a
+    # single unbuildable board DTB failing the whole arm64 package).  Must run
+    # before debian/control so enable_dtb propagates into rules.gen.
+    _disable_dtb_build(linux_dir, arch)
 
     # Step 3: Generate debian/control (intentionally fails with exit 1 even on success)
     print("=== Generating debian/control ===")

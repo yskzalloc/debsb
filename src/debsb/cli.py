@@ -13,9 +13,13 @@ from pathlib import Path
 
 DEBSB_DIR = os.path.join(str(Path.home()), ".debsb")
 
-# Debian architecture name -> everything that differs between guests.  Only the
-# host architecture is ever used: debsb builds kernels natively and boots with
-# KVM, so cross-architecture emulation is out of scope.
+# Debian architecture name -> everything that differs between guests.  The
+# target architecture is normally the host's, but --arch selects a foreign one:
+# debsb then boots that guest under TCG emulation (KVM cannot run a CPU it does
+# not natively implement) and cross-compiles any kernel for it.
+#
+# 'kernel_arch'/'cross_compile' drive kernel cross-builds; 'deb_pkgs' lists the
+# QEMU host packages that provide SPEC["qemu"] on Debian/Ubuntu.
 ARCHES = {
     "amd64": {
         "qemu": "qemu-system-x86_64",
@@ -32,6 +36,10 @@ ARCHES = {
         "root_dev": "/dev/sda",
         "nic": "nic",
         "gfx": ["-vga", "virtio"],
+        # Linux Kbuild ARCH= and the Debian toolchain triplet for cross builds.
+        "kernel_arch": "x86_64",
+        "cross_compile": "x86_64-linux-gnu-",
+        "cross_gcc_pkg": "gcc-x86-64-linux-gnu",
     },
     "arm64": {
         "qemu": "qemu-system-aarch64",
@@ -40,15 +48,22 @@ ARCHES = {
         # guest boots off UEFI (see uefi_args) with virtio disks.
         "machine": ["-machine", "virt"],
         # 'virt' defaults to the 32-bit cortex-a15, which KVM rejects outright;
-        # a CPU model is mandatory here, unlike on amd64.
+        # a CPU model is mandatory here, unlike on amd64.  Under TCG 'max'
+        # models a full-featured aarch64 CPU regardless of the host.
         "cpu_kvm": "host",
         "cpu_tcg": "max",
+        # 'ttyAMA0' is the PL011 UART the virt machine exposes.  A guest kernel
+        # must have CONFIG_SERIAL_AMBA_PL011=y (and _CONSOLE=y) or the serial
+        # console -- and therefore ~/.debsb/serial.log -- stays empty.
         "console": "ttyAMA0",
         "disk_opts": "if=virtio",
         "seed_opts": "if=virtio",
         "root_dev": "/dev/vda",
         "nic": "nic,model=virtio-net-pci",
         "gfx": ["-device", "virtio-gpu-pci"],
+        "kernel_arch": "arm64",
+        "cross_compile": "aarch64-linux-gnu-",
+        "cross_gcc_pkg": "gcc-aarch64-linux-gnu",
     },
 }
 
@@ -71,14 +86,38 @@ def _host_arch():
     return {"x86_64": "amd64", "aarch64": "arm64"}.get(platform.machine(), platform.machine())
 
 
+# The architecture debsb builds and boots.  Defaults to the host's; --arch
+# overrides it (set_target_arch), in which case the guest runs under TCG.
 ARCH = _host_arch()
 SPEC = ARCHES.get(ARCH)
 
-IMAGE_NAME = f"debian-sid-generic-{ARCH}-daily"
-IMAGE_URL = (
-    "https://cloud.debian.org/images/cloud/sid/daily/latest/"
-    f"{IMAGE_NAME}.qcow2"
-)
+
+def set_target_arch(arch):
+    """Select the target (guest/build) architecture.  None keeps the host's."""
+    global ARCH, SPEC
+    if arch:
+        ARCH = arch
+    SPEC = ARCHES.get(ARCH)
+
+
+def is_cross():
+    """True when the target architecture differs from the host's.
+
+    A cross target cannot use KVM (the host CPU cannot execute a foreign
+    instruction set) and needs a cross toolchain for kernel builds.
+    """
+    return ARCH != _host_arch()
+
+
+def image_name():
+    return f"debian-sid-generic-{ARCH}-daily"
+
+
+def image_url():
+    return ("https://cloud.debian.org/images/cloud/sid/daily/latest/"
+            f"{image_name()}.qcow2")
+
+
 SSH_PORT = 2222
 SSH_KEY = os.path.join(DEBSB_DIR, "id_ed25519")
 
@@ -97,8 +136,26 @@ def die(msg):
 
 def check_arch():
     if SPEC is None:
-        die(f"unsupported architecture: {platform.machine()} "
+        die(f"unsupported architecture: {ARCH} "
             f"(supported: {', '.join(sorted(ARCHES))})")
+
+
+def check_cross_toolchain():
+    """Kernel cross-builds need the target's *-linux-gnu-gcc unless clang is used.
+
+    LLVM=1 (or a clang CC/HOSTCC) is a native cross compiler and needs only the
+    target headers, so it is exempt from the gcc-triplet requirement.
+    """
+    if not is_cross():
+        return
+    using_clang = os.environ.get("LLVM") or "clang" in os.environ.get("CC", "")
+    if using_clang:
+        return
+    cc = SPEC["cross_compile"] + "gcc"
+    if not shutil.which(cc):
+        die(f"cross-compiling a {ARCH} kernel on {_host_arch()} needs {cc}.\n"
+            f"  Install with: sudo apt install {SPEC['cross_gcc_pkg']}\n"
+            f"  (or build with LLVM=1 to use clang as a native cross compiler)")
 
 
 def check_deps():
@@ -118,6 +175,10 @@ def _first_existing(paths):
 
 
 def kvm_available():
+    # A foreign-arch guest can never use KVM even on a KVM-capable host: the
+    # CPU cannot execute a different instruction set, so force TCG when cross.
+    if is_cross():
+        return False
     return os.access("/dev/kvm", os.R_OK | os.W_OK)
 
 
@@ -157,8 +218,29 @@ def kernel_make_vars():
     assignment win over the environment -- so `export CC=clang` alone has no
     effect and the build silently falls back to gcc.  Only a command-line
     assignment (or LLVM=1) actually switches the compiler.
+
+    When building for a foreign architecture we also add ARCH= and
+    CROSS_COMPILE= so Kbuild targets the guest's instruction set.  These, too,
+    have to be command-line assignments: the top-level Makefile sets them from
+    SUBARCH otherwise.  LLVM=1 clang can cross-compile with just ARCH= (it is a
+    native cross compiler), but a gcc build needs the matching *-linux-gnu-gcc,
+    so CROSS_COMPILE is always supplied and harmlessly ignored by clang when
+    the user also sets CC/HOSTCC to clang paths.
     """
-    return [f"{v}={os.environ[v]}" for v in KERNEL_MAKE_VARS if os.environ.get(v)]
+    vars_ = [f"{v}={os.environ[v]}" for v in KERNEL_MAKE_VARS if os.environ.get(v)]
+    if is_cross():
+        vars_ += [f"ARCH={SPEC['kernel_arch']}",
+                  f"CROSS_COMPILE={SPEC['cross_compile']}"]
+        # bindeb-pkg builds the .deb with `dpkg-buildpackage -a <target-arch>`,
+        # whose dpkg-checkbuilddeps then demands the *target-arch* -dev packages
+        # (libssl-dev:arm64, libelf-dev:arm64, ...).  A cross host has only the
+        # native -dev headers plus the cross toolchain, which is all the compile
+        # actually needs, so the check spuriously fails with "Unmet build
+        # dependencies".  DPKG_FLAGS=-d, which Kbuild appends verbatim to that
+        # dpkg-buildpackage call, skips the check.  It is inert on the config
+        # targets (defconfig/olddefconfig), which ignore the variable.
+        vars_ += ["DPKG_FLAGS=-d"]
+    return vars_
 
 
 def qemu_cmd(qcow2, cloud_img, hostfwd):
@@ -201,11 +283,11 @@ def port_in_use(port):
 
 
 def qcow2_path():
-    return os.path.join(DEBSB_DIR, f"{IMAGE_NAME}.qcow2")
+    return os.path.join(DEBSB_DIR, f"{image_name()}.qcow2")
 
 
 def cloud_img_path():
-    return os.path.join(DEBSB_DIR, f"{IMAGE_NAME}.img")
+    return os.path.join(DEBSB_DIR, f"{image_name()}.img")
 
 
 def ssh_opts():
@@ -403,7 +485,7 @@ def setup_image(args):
 
     # Download image
     print("Downloading Debian Sid cloud image...")
-    subprocess.check_call(["wget", "-q", "--show-progress", "-O", qcow2, IMAGE_URL])
+    subprocess.check_call(["wget", "-q", "--show-progress", "-O", qcow2, image_url()])
 
     # Resize
     size = args.size or "20G"
@@ -512,12 +594,19 @@ def setup_image(args):
 
 def cmd_build(args):
     check_deps()
+
+    # A cross kernel build needs the target toolchain; check before the long
+    # image download so the user is not left waiting only to fail at compile.
+    if args.debian or args.kernel_dir:
+        check_cross_toolchain()
+
     setup_image(args)
 
     if args.debian:
         from debsb.debian import debian_build
         debs = debian_build(DEBSB_DIR, args.branch, args.configitem,
-                            verbose=args.verbose, reset=args.reset)
+                            verbose=args.verbose, reset=args.reset,
+                            arch=ARCH, cross=is_cross())
         if not debs:
             die("no kernel .deb found after Debian kernel build")
         # Only install essential packages: base, binary-unsigned, modules
@@ -583,6 +672,16 @@ def cmd_build(args):
         # would otherwise drop the =y transport that depends on it.
         for opt in ("CONFIG_NET_9P", "CONFIG_NET_9P_VIRTIO", "CONFIG_9P_FS"):
             subprocess.check_call(["./scripts/config", "--enable", opt], cwd=kernel_dir)
+        # The arm64 guest's console is the virt machine's PL011 UART.  Without
+        # CONFIG_SERIAL_AMBA_PL011=y (and its console) the guest has no serial
+        # console: the boot is invisible and ~/.debsb/serial.log stays empty.
+        # It is =y in the arm64 defconfig today, but pin it so a config change
+        # or a --configitem override cannot silently take the console away.
+        if ARCH == "arm64":
+            for opt in ("CONFIG_SERIAL_AMBA_PL011",
+                        "CONFIG_SERIAL_AMBA_PL011_CONSOLE"):
+                subprocess.check_call(["./scripts/config", "--enable", opt],
+                                      cwd=kernel_dir)
 
     # Step 2: Apply --configitem
     if args.configitem:
@@ -691,9 +790,14 @@ def main():
     parser = argparse.ArgumentParser(prog="debsb", description="Debian Sid Sandbox")
     sub = parser.add_subparsers(dest="command")
 
+    arch_help = ("Target architecture (%s). Defaults to the host's. A foreign "
+                 "arch boots under TCG emulation." % ", ".join(sorted(ARCHES)))
+
     p_build = sub.add_parser("build", help="Build sandbox (optionally with kernel)")
     p_build.add_argument("kernel_dir", nargs="?", default=None,
                          help="Path to kernel source tree (triggers kernel build)")
+    p_build.add_argument("--arch", choices=sorted(ARCHES), default=None,
+                         metavar="ARCH", help=arch_help)
     p_build.add_argument("--debian", action="store_true",
                          help="Build Debian kernel from salsa.debian.org")
     p_build.add_argument("--branch", metavar="BRANCH",
@@ -705,6 +809,8 @@ def main():
     p_build.add_argument("--reset", action="store_true", help="Reset image without asking")
 
     p_run = sub.add_parser("run", help="Boot the sandbox VM")
+    p_run.add_argument("--arch", choices=sorted(ARCHES), default=None,
+                       metavar="ARCH", help=arch_help)
     p_run.add_argument("--ssh", action="store_true", help="Boot headless, open SSH session")
     p_run.add_argument("--root", action="store_true", help="Login as root (default: debian user)")
     p_run.add_argument("--exec", metavar="CMD", help="Boot, run command via SSH, then shutdown")
@@ -717,8 +823,10 @@ def main():
 
     args = parser.parse_args()
     if args.command == "build":
+        set_target_arch(args.arch)
         cmd_build(args)
     elif args.command == "run":
+        set_target_arch(args.arch)
         cmd_run(args)
     else:
         parser.print_help()
