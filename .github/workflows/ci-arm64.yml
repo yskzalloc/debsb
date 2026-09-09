@@ -63,7 +63,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y qemu-system-arm qemu-efi-aarch64 \
-            cloud-image-utils whois wget openssh-client
+            cloud-image-utils whois wget openssh-client libslirp-dev
 
       - name: Install debsb
         run: pip install -e .

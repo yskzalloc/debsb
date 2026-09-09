@@ -66,12 +66,12 @@ comes up.
 
 On Debian/Ubuntu, amd64:
 ```bash
-sudo apt install qemu-system-x86 cloud-image-utils whois wget openssh-client
+sudo apt install qemu-system-x86 cloud-image-utils whois wget openssh-client libslirp-dev
 ```
 
 On Debian/Ubuntu, arm64:
 ```bash
-sudo apt install qemu-system-arm qemu-efi-aarch64 cloud-image-utils whois wget openssh-client
+sudo apt install qemu-system-arm qemu-efi-aarch64 cloud-image-utils whois wget openssh-client libslirp-dev
 ```
 
 For upstream kernel builds (`debsb build <path>`), additionally:
